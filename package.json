@@ -1,0 +1,18 @@
+{
+  "name": "feishu-agent-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch gateway/main.js",
+    "start": "node gateway/main.js",
+    "selfcheck:feishu": "node scripts/feishu-selfcheck.mjs",
+    "test": "node --test",
+    "test:iflow": "node --test tests/iflow-receive-smoke.test.js"
+  },
+  "dependencies": {
+    "@iflow-ai/iflow-cli-sdk": "^0.2.1-beta.5",
+    "@larksuiteoapi/node-sdk": "^1.59.0",
+    "@opencode-ai/sdk": "^1.2.22"
+  }
+}

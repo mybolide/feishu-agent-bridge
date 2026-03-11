@@ -1,0 +1,357 @@
+param(
+  [int]$Port = 7071,
+  [switch]$SkipInstall,
+  [switch]$SkipOpenCodeServer
+)
+
+$ErrorActionPreference = "Stop"
+$root = Resolve-Path (Join-Path $PSScriptRoot "..")
+$nodePackage = Join-Path $root "package.json"
+$gatewayEntry = Join-Path $root "gateway\main.js"
+$logDir = Join-Path $root "logs"
+$pidFile = Join-Path $logDir "gateway-processes.json"
+
+if (!(Test-Path $nodePackage)) {
+  throw "package.json not found: $nodePackage"
+}
+if (!(Test-Path $gatewayEntry)) {
+  throw "gateway entry not found: $gatewayEntry"
+}
+if (!(Test-Path $logDir)) {
+  New-Item -ItemType Directory -Path $logDir | Out-Null
+}
+
+function Get-EnvValue {
+  param([string]$Key, [string]$Default = "")
+  $existing = [Environment]::GetEnvironmentVariable($Key)
+  if ($existing -and $existing.Trim() -ne "") {
+    return $existing.Trim()
+  }
+  $envFile = Join-Path $root ".env"
+  if (Test-Path $envFile) {
+    $line = Get-Content $envFile | Where-Object { $_ -match "^\s*$Key\s*=" } | Select-Object -First 1
+    if ($line) {
+      return ($line -split "=", 2)[1].Trim()
+    }
+  }
+  return $Default
+}
+
+function Test-TcpPort {
+  param([string]$HostName, [int]$TargetPort, [int]$TimeoutMs = 1000)
+  try {
+    $client = New-Object System.Net.Sockets.TcpClient
+    $iar = $client.BeginConnect($HostName, $TargetPort, $null, $null)
+    if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+      $client.Close()
+      return $false
+    }
+    $client.EndConnect($iar)
+    $client.Close()
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Stop-ProcessesOnPort {
+  param([int]$TargetPort, [string]$Reason = "restart")
+  $rows = @()
+  try {
+    $rows = Get-NetTCPConnection -LocalPort $TargetPort -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique
+  } catch {
+    $rows = @()
+  }
+  foreach ($procId in @($rows)) {
+    if ($procId -and $procId -ne $PID) {
+      try {
+        Stop-Process -Id $procId -Force -ErrorAction Stop
+        Write-Host "[start] killed process $procId on port $TargetPort ($Reason)"
+      } catch {
+        Write-Warning "[start] failed to kill pid=$procId on port ${TargetPort}: $($_.Exception.Message)"
+      }
+    }
+  }
+}
+
+function Wait-Port {
+  param([string]$HostName, [int]$TargetPort, [int]$Rounds = 20)
+  for ($i = 0; $i -lt $Rounds; $i++) {
+    if (Test-TcpPort -HostName $HostName -TargetPort $TargetPort) {
+      return $true
+    }
+    Start-Sleep -Seconds 1
+  }
+  return $false
+}
+
+function Wait-LogPattern {
+  param(
+    [string]$FilePath,
+    [string[]]$Patterns,
+    [int]$Rounds = 30
+  )
+  for ($i = 0; $i -lt $Rounds; $i++) {
+    if (Test-Path $FilePath) {
+      $text = Get-Content -Path $FilePath -Raw -ErrorAction SilentlyContinue
+      foreach ($pattern in $Patterns) {
+        if ($text -like "*$pattern*") {
+          return $true
+        }
+      }
+    }
+    Start-Sleep -Seconds 1
+  }
+  return $false
+}
+
+function Wait-LogPatternAll {
+  param(
+    [string]$FilePath,
+    [string[]]$Patterns,
+    [int]$Rounds = 30
+  )
+  for ($i = 0; $i -lt $Rounds; $i++) {
+    if (Test-Path $FilePath) {
+      $text = Get-Content -Path $FilePath -Raw -ErrorAction SilentlyContinue
+      $allMatched = $true
+      foreach ($pattern in $Patterns) {
+        if ($text -notlike "*$pattern*") {
+          $allMatched = $false
+          break
+        }
+      }
+      if ($allMatched) {
+        return $true
+      }
+    }
+    Start-Sleep -Seconds 1
+  }
+  return $false
+}
+
+function Write-GatewayPidFile {
+  param(
+    [string]$FilePath,
+    [string]$ProjectRoot,
+    [int]$GatewayPid,
+    [int]$OpenCodePid = 0,
+    [int[]]$ExtraPids = @()
+  )
+  $normalizedExtraPids = @($ExtraPids | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+  $payload = [ordered]@{
+    projectRoot = [string]$ProjectRoot
+    updatedAt = [DateTimeOffset]::UtcNow.ToString("o")
+    gatewayPid = [int]$GatewayPid
+    opencodePid = if ($OpenCodePid -gt 0) { [int]$OpenCodePid } else { 0 }
+    extraPids = $normalizedExtraPids
+  }
+  $json = $payload | ConvertTo-Json -Depth 4
+  Set-Content -Path $FilePath -Value $json -Encoding UTF8
+}
+
+function Find-GatewayRuntimePids {
+  param([string]$ProjectRoot)
+  $projectNorm = ([string]$ProjectRoot).ToLower().Replace("\", "/")
+  $gatewayNorm = ((Join-Path $ProjectRoot "gateway\main.js")).ToLower().Replace("\", "/")
+  $pids = @()
+  try {
+    $rows = Get-CimInstance Win32_Process -Filter "Name = 'node.exe'"
+  } catch {
+    $rows = @()
+  }
+  foreach ($row in $rows) {
+    $cmd = [string]$row.CommandLine
+    if ([string]::IsNullOrWhiteSpace($cmd)) {
+      continue
+    }
+    $cmdNorm = $cmd.ToLower().Replace("\", "/")
+    if ($cmdNorm.Contains($projectNorm) -and $cmdNorm.Contains("gateway/main.js")) {
+      $pids += [int]$row.ProcessId
+      continue
+    }
+    if ($cmdNorm.Contains($gatewayNorm)) {
+      $pids += [int]$row.ProcessId
+    }
+  }
+  return @($pids | Sort-Object -Unique)
+}
+
+function Start-OpenCodeServeProcess {
+  param(
+    [string]$CommandPath,
+    [string]$HostName,
+    [int]$TargetPort,
+    [string]$WorkDir,
+    [string]$OutLog,
+    [string]$ErrLog
+  )
+  $cmd = [string]$CommandPath
+  if (-not $cmd) {
+    return $null
+  }
+  try {
+    if ($cmd.ToLower().EndsWith(".cmd") -or $cmd.ToLower().EndsWith(".bat")) {
+      $line = "`"$cmd`" serve --hostname $HostName --port $TargetPort"
+      return Start-Process -WindowStyle Hidden -FilePath "cmd.exe" -ArgumentList @("/c", $line) -WorkingDirectory $WorkDir -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog -PassThru
+    } elseif ($cmd.ToLower().EndsWith(".ps1")) {
+      return Start-Process -WindowStyle Hidden -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $cmd, "serve", "--hostname", $HostName, "--port", "$TargetPort") -WorkingDirectory $WorkDir -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog -PassThru
+    } else {
+      return Start-Process -WindowStyle Hidden -FilePath $cmd -ArgumentList @("serve", "--hostname", $HostName, "--port", "$TargetPort") -WorkingDirectory $WorkDir -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog -PassThru
+    }
+  } catch {
+    return $null
+  }
+}
+
+function Stop-GatewayWatchers {
+  $killScript = Join-Path $PSScriptRoot "kill_gateway_processes.ps1"
+  if (Test-Path $killScript) {
+    try {
+      & $killScript
+    } catch {
+      Write-Warning "[start] kill script failed: $($_.Exception.Message)"
+    }
+  }
+}
+
+Stop-GatewayWatchers
+Stop-ProcessesOnPort -TargetPort $Port -Reason "node-gateway restart"
+if (Test-Path $pidFile) {
+  Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+}
+$openCodeProc = $null
+
+if (-not $SkipInstall) {
+  Write-Host "[start] syncing node dependencies..."
+  Push-Location $root
+  try {
+    npm install
+  } finally {
+    Pop-Location
+  }
+}
+
+if (-not $SkipOpenCodeServer) {
+  $serverUrl = Get-EnvValue -Key "OPENCODE_SERVER_URL" -Default "http://127.0.0.1:14096"
+  try {
+    $uri = [System.Uri]$serverUrl
+    $hostName = if ($uri.Host) { $uri.Host } else { "127.0.0.1" }
+    $ocPort = if ($uri.Port -gt 0) { $uri.Port } else { 14096 }
+  } catch {
+    $hostName = "127.0.0.1"
+    $ocPort = 14096
+  }
+
+  if (-not (Test-TcpPort -HostName $hostName -TargetPort $ocPort)) {
+    Write-Host "[start] OpenCode server not reachable, starting on $hostName`:$ocPort ..."
+    $candidates = @()
+    $envOpencode = Get-EnvValue -Key "OPENCODE_COMMAND" -Default ""
+    if ($envOpencode) { $candidates += $envOpencode }
+    try {
+      $cmdSource = (Get-Command opencode -ErrorAction Stop).Source
+      if ($cmdSource) { $candidates += $cmdSource }
+    } catch {}
+    $candidates += "opencode"
+    $candidates = $candidates | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique
+
+    $ocOutLog = Join-Path $logDir "opencode-serve.out.log"
+    $ocErrLog = Join-Path $logDir "opencode-serve.err.log"
+    if (Test-Path $ocOutLog) { Remove-Item $ocOutLog -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $ocErrLog) { Remove-Item $ocErrLog -Force -ErrorAction SilentlyContinue }
+
+    $spawned = $false
+    $openCodeProc = $null
+    foreach ($candidate in $candidates) {
+      $spawnProc = Start-OpenCodeServeProcess -CommandPath $candidate -HostName $hostName -TargetPort $ocPort -WorkDir $root -OutLog $ocOutLog -ErrLog $ocErrLog
+      if ($spawnProc) {
+        if (Wait-Port -HostName $hostName -TargetPort $ocPort -Rounds 6) {
+          $spawned = $true
+          $openCodeProc = $spawnProc
+          break
+        }
+        try {
+          if (-not $spawnProc.HasExited) {
+            Stop-Process -Id $spawnProc.Id -Force -ErrorAction SilentlyContinue
+          }
+        } catch {}
+      }
+    }
+
+    if ($spawned -or (Wait-Port -HostName $hostName -TargetPort $ocPort -Rounds 20)) {
+      Write-Host "[start] OpenCode server ready at $hostName`:$ocPort"
+    } else {
+      Write-Warning "[start] OpenCode server still unreachable at $hostName`:$ocPort"
+      Write-Host "[start] see logs: $ocOutLog / $ocErrLog"
+    }
+  } else {
+    Write-Host "[start] OpenCode server already reachable"
+  }
+}
+
+$nodeOutLog = Join-Path $logDir "node-gateway.out.log"
+$nodeErrLog = Join-Path $logDir "node-gateway.err.log"
+if (Test-Path $nodeOutLog) { Remove-Item $nodeOutLog -Force -ErrorAction SilentlyContinue }
+if (Test-Path $nodeErrLog) { Remove-Item $nodeErrLog -Force -ErrorAction SilentlyContinue }
+
+Write-Host "[start] launching gateway sdk worker (default hot reload) ..."
+$nodeCmd = "node.exe"
+try {
+  $resolvedNode = (Get-Command node.exe -ErrorAction Stop).Source
+  if ($resolvedNode) { $nodeCmd = $resolvedNode }
+} catch {}
+
+$env:NODE_GATEWAY_PORT = "$Port"
+$gatewayProc = Start-Process -WindowStyle Hidden -FilePath $nodeCmd -ArgumentList @(
+  "--watch",
+  $gatewayEntry
+) -WorkingDirectory $root -RedirectStandardOutput $nodeOutLog -RedirectStandardError $nodeErrLog -PassThru
+
+$openCodePid = 0
+try {
+  if ($openCodeProc -and -not $openCodeProc.HasExited) {
+    $openCodePid = [int]$openCodeProc.Id
+  }
+} catch {}
+Write-GatewayPidFile -FilePath $pidFile -ProjectRoot $root -GatewayPid ([int]$gatewayProc.Id) -OpenCodePid $openCodePid
+Write-Host "[start] pid file updated: $pidFile (gateway=$($gatewayProc.Id), opencode=$openCodePid)"
+
+$connectionMode = (Get-EnvValue -Key "FEISHU_CONNECTION_MODE" -Default "long_connection").ToLower()
+if ($connectionMode -ne "long_connection") {
+  Write-Warning "[start] FEISHU_CONNECTION_MODE=$connectionMode is not supported in sdk-only mode; expected long_connection"
+}
+
+if ($connectionMode -eq "long_connection") {
+  $ready = Wait-LogPatternAll -FilePath $nodeOutLog -Patterns @(
+    "[feishu] ws preflight ok",
+    "[feishu] long connection started",
+    "[feishu] ws startup check ok",
+    "[gateway] mode=long_connection"
+  ) -Rounds 45
+} else {
+  $ready = Wait-LogPattern -FilePath $nodeOutLog -Patterns @(
+    "[gateway] mode=long_connection",
+    "[feishu] long connection started",
+    "[feishu] skip long connection"
+  ) -Rounds 30
+}
+if ($gatewayProc.HasExited) {
+  Write-Warning "[start] gateway process exited unexpectedly (exit=$($gatewayProc.ExitCode))"
+  if (Test-Path $pidFile) { Remove-Item $pidFile -Force -ErrorAction SilentlyContinue }
+  Write-Host "[start] see logs: $nodeOutLog / $nodeErrLog"
+  if (Test-Path $nodeOutLog) { Get-Content -Path $nodeOutLog -Tail 80 }
+  if (Test-Path $nodeErrLog) { Get-Content -Path $nodeErrLog -Tail 80 }
+  exit 1
+}
+if (-not $ready) {
+  Write-Warning "[start] gateway started but readiness log not observed yet (mode=$connectionMode)"
+}
+$runtimePids = Find-GatewayRuntimePids -ProjectRoot $root
+$trackedGatewayPid = if ($runtimePids.Count -gt 0) { [int]$runtimePids[0] } else { [int]$gatewayProc.Id }
+$extraTrackedPids = @([int]$gatewayProc.Id)
+if ($runtimePids.Count -gt 1) {
+  $extraTrackedPids += @($runtimePids | Select-Object -Skip 1)
+}
+Write-GatewayPidFile -FilePath $pidFile -ProjectRoot $root -GatewayPid $trackedGatewayPid -OpenCodePid $openCodePid -ExtraPids $extraTrackedPids
+Write-Host "[start] pid file refreshed: gateway=$trackedGatewayPid extra=$($extraTrackedPids -join ',') opencode=$openCodePid"
+Write-Host "[start] done."
