@@ -38,6 +38,7 @@ function buildErrorCard(providerId, errorMessage) {
 
 export async function showModelCardFlow(chatId, deps, options = {}) {
   const page = Math.max(0, Number.parseInt(String(options?.page ?? 0), 10) || 0);
+  const forceRefresh = options?.forceRefresh === undefined ? page === 0 : Boolean(options.forceRefresh);
   const getSelectedTool = deps?.getSelectedTool;
   const getProvider = deps?.getProvider;
   const getCurrentModel = deps?.getCurrentModel;
@@ -70,7 +71,7 @@ export async function showModelCardFlow(chatId, deps, options = {}) {
   const messageId = String(loading?.messageId || "").trim();
 
   try {
-    const models = await provider.model.list(true);
+    const models = await provider.model.list(forceRefresh);
     if (!Array.isArray(models) || models.length === 0) {
       await dispatchInteractiveCard(chatId, buildWarnCard(providerId, "暂无可用模型，请检查配置。"), {
         messageId,

@@ -1,11 +1,10 @@
 import { IFlowClient } from "@iflow-ai/iflow-cli-sdk";
 import { createClientOptions } from "./client-options.js";
-import { MODEL_CACHE_TTL_MS, REQUEST_TIMEOUT_MS, parseModelId, withTimeout } from "./common.js";
+import { REQUEST_TIMEOUT_MS, parseModelId, withTimeout } from "./common.js";
 import { listSessionMetaRows, resolveModelProbeDirectory, upsertSessionMeta } from "./session-meta-store.js";
-import { safeDisconnect } from "./session-pool.js";
+import { safeDisconnect } from "./session-runtime.js";
 
-let modelCacheRows = [];
-let modelCacheAt = 0;
+let lastSuccessfulRows = [];
 
 function normalizeModelRows(rawModels) {
   const rows = Array.isArray(rawModels)
@@ -39,84 +38,83 @@ function appendModelIfValid(target, seen, rawModel) {
   target.push(normalized);
 }
 
-export async function listModels(forceRefresh = false) {
-  const now = Date.now();
-  if (!forceRefresh && modelCacheRows.length > 0 && (now - modelCacheAt) < MODEL_CACHE_TTL_MS) {
-    return [...modelCacheRows];
-  }
-  const probeDirectory = resolveModelProbeDirectory();
-
-  const fetchModels = async (mode) => {
-    const client = new IFlowClient(createClientOptions(probeDirectory));
-    try {
-      if (mode === "skip") {
+async function fetchModels(mode, probeDirectory) {
+  const client = new IFlowClient(createClientOptions(probeDirectory));
+  try {
+    if (mode === "skip") {
+      await withTimeout(
+        client.connect({ skipSession: true }),
+        REQUEST_TIMEOUT_MS,
+        `iFlow list models connect directory=${probeDirectory} mode=skip`
+      );
+    } else if (mode === "new") {
+      await withTimeout(
+        client.connect(),
+        REQUEST_TIMEOUT_MS,
+        `iFlow list models connect directory=${probeDirectory} mode=new`
+      );
+      const sessionId = String(client.getSessionId?.() || "").trim();
+      if (sessionId) {
+        upsertSessionMeta(sessionId, probeDirectory, "iflow-model-probe");
+      }
+    } else {
+      const latestSessionId = String(listSessionMetaRows(probeDirectory)?.[0]?.session_id || "").trim();
+      if (latestSessionId) {
         await withTimeout(
           client.connect({ skipSession: true }),
           REQUEST_TIMEOUT_MS,
-          `iFlow list models connect directory=${probeDirectory} mode=skip`
+          `iFlow list models connect directory=${probeDirectory} mode=load`
+        );
+        await withTimeout(
+          client.loadSession(latestSessionId),
+          REQUEST_TIMEOUT_MS,
+          `iFlow list models loadSession=${latestSessionId}`
         );
       } else {
-        if (mode === "new") {
-          await withTimeout(
-            client.connect(),
-            REQUEST_TIMEOUT_MS,
-            `iFlow list models connect directory=${probeDirectory} mode=new`
-          );
-          const sessionId = String(client.getSessionId?.() || "").trim();
-          if (sessionId) {
-            upsertSessionMeta(sessionId, probeDirectory, "iflow-model-probe");
-          }
-        } else {
-          const latestSessionId = String(listSessionMetaRows(probeDirectory)?.[0]?.session_id || "").trim();
-          if (latestSessionId) {
-            await withTimeout(
-              client.connect({ skipSession: true }),
-              REQUEST_TIMEOUT_MS,
-              `iFlow list models connect directory=${probeDirectory} mode=load`
-            );
-            await withTimeout(
-              client.loadSession(latestSessionId),
-              REQUEST_TIMEOUT_MS,
-              `iFlow list models loadSession=${latestSessionId}`
-            );
-          } else {
-            await withTimeout(
-              client.connect(),
-              REQUEST_TIMEOUT_MS,
-              `iFlow list models connect directory=${probeDirectory} mode=load-no-history`
-            );
-          }
-        }
-      }
-      const payload = await withTimeout(client.config.get("models"), REQUEST_TIMEOUT_MS, "iFlow config.get(models)");
-      const rows = normalizeModelRows(payload);
-      const seen = new Set(rows);
-      if (rows.length === 0) {
-        const currentModel = await withTimeout(
-          client.config.get("model").catch(() => ""),
+        await withTimeout(
+          client.connect(),
           REQUEST_TIMEOUT_MS,
-          "iFlow config.get(model)"
+          `iFlow list models connect directory=${probeDirectory} mode=load-no-history`
         );
-        appendModelIfValid(rows, seen, currentModel);
-        appendModelIfValid(rows, seen, process.env.IFLOW_MODEL_NAME || "");
       }
-      return rows;
-    } finally {
-      await safeDisconnect(client);
     }
-  };
 
-  let rows = await fetchModels("skip");
-  if (rows.length === 0) {
-    console.log("[trace][iflow] listModels empty on skipSession, fallback to load/new session");
-    rows = await fetchModels("load");
+    const payload = await withTimeout(client.config.get("models"), REQUEST_TIMEOUT_MS, "iFlow config.get(models)");
+    const rows = normalizeModelRows(payload);
+    const seen = new Set(rows);
+    if (rows.length === 0) {
+      const currentModel = await withTimeout(
+        client.config.get("model").catch(() => ""),
+        REQUEST_TIMEOUT_MS,
+        "iFlow config.get(model)"
+      );
+      appendModelIfValid(rows, seen, currentModel);
+      appendModelIfValid(rows, seen, process.env.IFLOW_MODEL_NAME || "");
+    }
+    return rows;
+  } finally {
+    await safeDisconnect(client);
   }
-  if (rows.length === 0) {
-    console.log("[trace][iflow] listModels empty on loaded session, fallback to new session");
-    rows = await fetchModels("new");
-  }
+}
 
-  modelCacheRows = rows;
-  modelCacheAt = now;
-  return [...modelCacheRows];
+export async function listModels(forceRefresh = false) {
+  void forceRefresh;
+  const probeDirectory = resolveModelProbeDirectory();
+
+  try {
+    let rows = await fetchModels("skip", probeDirectory);
+    if (rows.length === 0) {
+      console.log("[trace][iflow] listModels empty on skipSession, fallback to load/new session");
+      rows = await fetchModels("load", probeDirectory);
+    }
+    if (rows.length === 0) {
+      console.log("[trace][iflow] listModels empty on loaded session, fallback to new session");
+      rows = await fetchModels("new", probeDirectory);
+    }
+    lastSuccessfulRows = rows;
+    return [...rows];
+  } catch (error) {
+    console.warn(`[trace][iflow] listModels error message=${error instanceof Error ? error.message : String(error)}`);
+    return [...lastSuccessfulRows];
+  }
 }

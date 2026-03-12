@@ -54,6 +54,126 @@ function Test-TcpPort {
   }
 }
 
+function Test-OpenCodeHealth {
+  param([string]$ServerUrl, [int]$TimeoutMs = 2500)
+  $client = $null
+  $handler = $null
+  try {
+    $baseUrl = [string]$ServerUrl
+    if (-not $baseUrl) {
+      return $false
+    }
+    $healthUrl = $baseUrl.TrimEnd("/") + "/global/health"
+    $handler = New-Object System.Net.Http.HttpClientHandler
+    $handler.UseProxy = $false
+    $client = New-Object System.Net.Http.HttpClient($handler)
+    $client.Timeout = [TimeSpan]::FromMilliseconds([Math]::Max(500, $TimeoutMs))
+    $response = $client.GetAsync($healthUrl).GetAwaiter().GetResult()
+    if (-not $response.IsSuccessStatusCode) {
+      return $false
+    }
+    $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    if (-not $body) {
+      return $false
+    }
+    $json = $body | ConvertFrom-Json -ErrorAction Stop
+    return ($json.healthy -eq $true) -and (-not [string]::IsNullOrWhiteSpace([string]$json.version))
+  } catch {
+    return $false
+  } finally {
+    if ($client) {
+      $client.Dispose()
+    }
+    if ($handler) {
+      $handler.Dispose()
+    }
+  }
+}
+
+function Find-FreeTcpPort {
+  param(
+    [string]$HostName,
+    [int]$StartPort,
+    [int]$MaxAttempts = 30
+  )
+  $begin = [Math]::Max(1024, $StartPort)
+  for ($port = $begin; $port -lt ($begin + [Math]::Max(1, $MaxAttempts)); $port++) {
+    if (-not (Test-TcpPort -HostName $HostName -TargetPort $port)) {
+      return $port
+    }
+  }
+  return 0
+}
+
+function Get-OpenCodeCandidateUrls {
+  param(
+    [string]$ServerUrl,
+    [int]$ScanLimit = 40
+  )
+  $normalized = [string]$ServerUrl
+  if (-not $normalized) {
+    $normalized = "http://127.0.0.1:24096"
+  }
+  try {
+    $uri = [System.Uri]$normalized
+  } catch {
+    $uri = [System.Uri]"http://127.0.0.1:24096"
+  }
+
+  $scheme = if ($uri.Scheme) { $uri.Scheme } else { "http" }
+  $hostName = if ($uri.Host) { $uri.Host } else { "127.0.0.1" }
+  $port = if ($uri.Port -gt 0) { $uri.Port } else { 24096 }
+  $base = "${scheme}://${hostName}:$port"
+  $results = [System.Collections.Generic.List[string]]::new()
+  $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+  $push = {
+    param([string]$Value)
+    $candidate = [string]$Value
+    if (-not $candidate) {
+      return
+    }
+    if ($candidate.EndsWith("/")) {
+      $candidate = $candidate.TrimEnd("/")
+    }
+    if ($seen.Add($candidate)) {
+      $results.Add($candidate)
+    }
+  }
+
+  & $push $base
+
+  $loopbackHosts = @("127.0.0.1", "localhost", "::1")
+  if ($loopbackHosts -notcontains $hostName.ToLower()) {
+    return @($results)
+  }
+
+  $legacyBasePorts = @($port, 24096, 14096) | Select-Object -Unique
+  $maxOffset = [Math]::Max(0, $ScanLimit)
+  foreach ($basePort in $legacyBasePorts) {
+    for ($offset = 0; $offset -le $maxOffset; $offset++) {
+      & $push "${scheme}://${hostName}:$($basePort + $offset)"
+    }
+  }
+
+  return @($results)
+}
+
+function Resolve-HealthyOpenCodeServerUrl {
+  param(
+    [string]$ServerUrl,
+    [int]$ScanLimit = 40,
+    [int]$TimeoutMs = 2500
+  )
+  $candidates = Get-OpenCodeCandidateUrls -ServerUrl $ServerUrl -ScanLimit $ScanLimit
+  foreach ($candidate in $candidates) {
+    if (Test-OpenCodeHealth -ServerUrl $candidate -TimeoutMs $TimeoutMs) {
+      return $candidate
+    }
+  }
+  return ""
+}
+
 function Stop-ProcessesOnPort {
   param([int]$TargetPort, [string]$Reason = "restart")
   $rows = @()
@@ -233,59 +353,83 @@ if (-not $SkipInstall) {
 }
 
 if (-not $SkipOpenCodeServer) {
-  $serverUrl = Get-EnvValue -Key "OPENCODE_SERVER_URL" -Default "http://127.0.0.1:14096"
+  $serverUrl = Get-EnvValue -Key "OPENCODE_SERVER_URL" -Default "http://127.0.0.1:24096"
+  $scanLimit = 40
+  try {
+    $scanLimit = [Math]::Max(0, [int](Get-EnvValue -Key "OPENCODE_DISCOVERY_SCAN_LIMIT" -Default "40"))
+  } catch {
+    $scanLimit = 40
+  }
+  $existingHealthyServerUrl = Resolve-HealthyOpenCodeServerUrl -ServerUrl $serverUrl -ScanLimit $scanLimit -TimeoutMs 2500
+  if ($existingHealthyServerUrl) {
+    $env:OPENCODE_SERVER_URL = $existingHealthyServerUrl
+    Write-Host "[start] OpenCode server already healthy at $existingHealthyServerUrl"
+  } else {
   try {
     $uri = [System.Uri]$serverUrl
+    $scheme = if ($uri.Scheme) { $uri.Scheme } else { "http" }
     $hostName = if ($uri.Host) { $uri.Host } else { "127.0.0.1" }
-    $ocPort = if ($uri.Port -gt 0) { $uri.Port } else { 14096 }
+    $ocPort = if ($uri.Port -gt 0) { $uri.Port } else { 24096 }
   } catch {
+    $scheme = "http"
     $hostName = "127.0.0.1"
-    $ocPort = 14096
+    $ocPort = 24096
+  }
+  $serverUrl = "${scheme}://${hostName}:$ocPort"
+  $portReachable = Test-TcpPort -HostName $hostName -TargetPort $ocPort
+
+  if ($portReachable) {
+    Write-Warning "[start] OpenCode health check failed at $serverUrl; port $ocPort is occupied by a non-OpenCode or unhealthy process"
+    $fallbackPort = Find-FreeTcpPort -HostName $hostName -StartPort ($ocPort + 1) -MaxAttempts 40
+    if ($fallbackPort -le 0) {
+      Write-Warning "[start] no free fallback port found near $ocPort, will retry the configured port"
+    } else {
+      $ocPort = $fallbackPort
+      $serverUrl = "${scheme}://${hostName}:$ocPort"
+      Write-Host "[start] switching OpenCode server to fallback port $ocPort"
+    }
+  }
+  $env:OPENCODE_SERVER_URL = $serverUrl
+  Write-Host "[start] OpenCode server not reachable, starting on $hostName`:$ocPort ..."
+  $candidates = @()
+  $envOpencode = Get-EnvValue -Key "OPENCODE_COMMAND" -Default ""
+  if ($envOpencode) { $candidates += $envOpencode }
+  try {
+    $cmdSource = (Get-Command opencode -ErrorAction Stop).Source
+    if ($cmdSource) { $candidates += $cmdSource }
+  } catch {}
+  $candidates += "opencode"
+  $candidates = $candidates | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique
+
+  $ocOutLog = Join-Path $logDir "opencode-serve.out.log"
+  $ocErrLog = Join-Path $logDir "opencode-serve.err.log"
+  if (Test-Path $ocOutLog) { Remove-Item $ocOutLog -Force -ErrorAction SilentlyContinue }
+  if (Test-Path $ocErrLog) { Remove-Item $ocErrLog -Force -ErrorAction SilentlyContinue }
+
+  $spawned = $false
+  $openCodeProc = $null
+  foreach ($candidate in $candidates) {
+    $spawnProc = Start-OpenCodeServeProcess -CommandPath $candidate -HostName $hostName -TargetPort $ocPort -WorkDir $root -OutLog $ocOutLog -ErrLog $ocErrLog
+    if ($spawnProc) {
+      if ((Wait-Port -HostName $hostName -TargetPort $ocPort -Rounds 6) -and (Test-OpenCodeHealth -ServerUrl $serverUrl -TimeoutMs 4000)) {
+        $spawned = $true
+        $openCodeProc = $spawnProc
+        break
+      }
+      try {
+        if (-not $spawnProc.HasExited) {
+          Stop-Process -Id $spawnProc.Id -Force -ErrorAction SilentlyContinue
+        }
+      } catch {}
+    }
   }
 
-  if (-not (Test-TcpPort -HostName $hostName -TargetPort $ocPort)) {
-    Write-Host "[start] OpenCode server not reachable, starting on $hostName`:$ocPort ..."
-    $candidates = @()
-    $envOpencode = Get-EnvValue -Key "OPENCODE_COMMAND" -Default ""
-    if ($envOpencode) { $candidates += $envOpencode }
-    try {
-      $cmdSource = (Get-Command opencode -ErrorAction Stop).Source
-      if ($cmdSource) { $candidates += $cmdSource }
-    } catch {}
-    $candidates += "opencode"
-    $candidates = $candidates | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique
-
-    $ocOutLog = Join-Path $logDir "opencode-serve.out.log"
-    $ocErrLog = Join-Path $logDir "opencode-serve.err.log"
-    if (Test-Path $ocOutLog) { Remove-Item $ocOutLog -Force -ErrorAction SilentlyContinue }
-    if (Test-Path $ocErrLog) { Remove-Item $ocErrLog -Force -ErrorAction SilentlyContinue }
-
-    $spawned = $false
-    $openCodeProc = $null
-    foreach ($candidate in $candidates) {
-      $spawnProc = Start-OpenCodeServeProcess -CommandPath $candidate -HostName $hostName -TargetPort $ocPort -WorkDir $root -OutLog $ocOutLog -ErrLog $ocErrLog
-      if ($spawnProc) {
-        if (Wait-Port -HostName $hostName -TargetPort $ocPort -Rounds 6) {
-          $spawned = $true
-          $openCodeProc = $spawnProc
-          break
-        }
-        try {
-          if (-not $spawnProc.HasExited) {
-            Stop-Process -Id $spawnProc.Id -Force -ErrorAction SilentlyContinue
-          }
-        } catch {}
-      }
-    }
-
-    if ($spawned -or (Wait-Port -HostName $hostName -TargetPort $ocPort -Rounds 20)) {
-      Write-Host "[start] OpenCode server ready at $hostName`:$ocPort"
-    } else {
-      Write-Warning "[start] OpenCode server still unreachable at $hostName`:$ocPort"
-      Write-Host "[start] see logs: $ocOutLog / $ocErrLog"
-    }
+  if ($spawned -or ((Wait-Port -HostName $hostName -TargetPort $ocPort -Rounds 20) -and (Test-OpenCodeHealth -ServerUrl $serverUrl -TimeoutMs 4000))) {
+    Write-Host "[start] OpenCode server ready at $serverUrl"
   } else {
-    Write-Host "[start] OpenCode server already reachable"
+    Write-Warning "[start] OpenCode server still unhealthy at $serverUrl"
+    Write-Host "[start] see logs: $ocOutLog / $ocErrLog"
+  }
   }
 }
 

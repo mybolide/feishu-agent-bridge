@@ -87,3 +87,29 @@ test("showModelCardFlow updates error card when model list throws", async () => 
   assert.equal(calls[1].options.messageId, "msg-loading-error");
   assert.match(JSON.stringify(calls[1].card), /获取模型失败/);
 });
+
+test("showModelCardFlow should avoid force refresh when browsing non-first page", async () => {
+  const { calls, dispatchInteractiveCard } = createDispatchRecorder("msg-loading-page");
+  let refreshFlag = null;
+  await showModelCardFlow("chat-d", {
+    getSelectedTool: () => "opencode",
+    getProvider: () => ({
+      id: "opencode",
+      label: "OpenCode SDK",
+      model: {
+        list: async (forceRefresh) => {
+          refreshFlag = forceRefresh;
+          return ["opencode/model-a", "opencode/model-b", "opencode/model-c"];
+        }
+      }
+    }),
+    getCurrentModel: () => "opencode/model-a",
+    buildModelCard: (current, models, page) => ({ kind: "model_card", current, models, page }),
+    dispatchInteractiveCard
+  }, { page: 1 });
+
+  assert.equal(refreshFlag, false);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].options.messageId, "msg-loading-page");
+  assert.equal(calls[1].card.kind, "model_card");
+});

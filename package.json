@@ -7,6 +7,7 @@
     "dev": "node --watch gateway/main.js",
     "start": "node gateway/main.js",
     "selfcheck:feishu": "node scripts/feishu-selfcheck.mjs",
+    "diag:model": "node scripts/opencode-model-bench.mjs",
     "test": "node --test",
     "test:iflow": "node --test tests/iflow-receive-smoke.test.js"
   },

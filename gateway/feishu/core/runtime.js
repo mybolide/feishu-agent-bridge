@@ -214,16 +214,14 @@ async function processCardEvent(normalized, event, header, bind, abortRun) {
 
   console.log(`[feishu] card action resolved chat=${chatId} open_id=${opOpenId} source_message_id=${sourceMessageId} event_id=${eventId} action=${String(value.action || "")} value=${JSON.stringify(value).slice(0, 500)}`);
 
+  const fp = actionFingerprint(chatId, sourceMessageId, value);
+  if (fp && dedupOnce(fp, CARD_NO_EVENT_TTL_MS)) {
+    console.log(`[feishu] skip duplicate card action chat=${chatId} source_message_id=${sourceMessageId} action=${String(value.action || "")}`);
+    return { code: 200, payload: { success: true, duplicate: true } };
+  }
   if (eventId && dedupOnce(`event:${eventId}`, EVENT_DEDUP_TTL_MS)) {
     console.log(`[feishu] skip duplicate card event chat=${chatId} source_message_id=${sourceMessageId} event_id=${eventId}`);
     return { code: 200, payload: { success: true, duplicate: true } };
-  }
-  if (!eventId) {
-    const fp = actionFingerprint(chatId, sourceMessageId, value);
-    if (dedupOnce(fp, CARD_NO_EVENT_TTL_MS)) {
-      console.log(`[feishu] skip duplicate card action without event_id chat=${chatId} source_message_id=${sourceMessageId}`);
-      return { code: 200, payload: { success: true, duplicate: true } };
-    }
   }
 
   if (chatId) {
@@ -267,7 +265,8 @@ function buildEventDispatcher(run, bind, abortRun) {
       await processNormalizedEvent(data, run, bind, abortRun, eventType);
     } catch (error) {
       console.error(`[feishu] ${errorLabel} handler failed`, error);
-      if (eventType === "im.message.receive_v1") {
+      const alreadyNotified = Boolean(error && typeof error === "object" && error.__feishuUserNotified);
+      if (eventType === "im.message.receive_v1" && !alreadyNotified) {
         const message = (data && typeof data === "object" && data.message && typeof data.message === "object") ? data.message : {};
         const chatId = String((message && message.chat_id) || "").trim();
         if (chatId) {

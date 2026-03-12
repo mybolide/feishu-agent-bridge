@@ -1,14 +1,59 @@
 import { createOpencodeClient } from "@opencode-ai/sdk/v2/client";
 import { config } from "../../config/index.js";
-const CACHE_TTL_MS = 30_000;
-const DEFAULT_MODEL_LIST_TIMEOUT_MS = 15_000;
-let cacheRows = [];
-let cacheAt = 0;
+import { createOpencodeResolvedFetch } from "./server-discovery.js";
+const DEFAULT_MODEL_LIST_TIMEOUT_MS = 30_000;
+const DEFAULT_MODEL_LIST_RETRY_ATTEMPTS = 3;
+const DEFAULT_MODEL_LIST_RETRY_DELAY_MS = 500;
+const MAX_RETRY_DELAY_MS = 4000;
+let lastSuccessfulRows = [];
 function safeInt(raw, fallback) {
     const value = Number.parseInt(String(raw || "").trim(), 10);
     return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 const MODEL_LIST_TIMEOUT_MS = safeInt(process.env.OPENCODE_MODEL_LIST_TIMEOUT_MS, DEFAULT_MODEL_LIST_TIMEOUT_MS);
+const MODEL_LIST_RETRY_ATTEMPTS = safeInt(process.env.OPENCODE_MODEL_LIST_RETRY_ATTEMPTS, DEFAULT_MODEL_LIST_RETRY_ATTEMPTS);
+const MODEL_LIST_RETRY_DELAY_MS = safeInt(process.env.OPENCODE_MODEL_LIST_RETRY_DELAY_MS, DEFAULT_MODEL_LIST_RETRY_DELAY_MS);
+const OPENCODE_FETCH = createOpencodeResolvedFetch();
+function readErrorCode(error) {
+    const direct = String(error?.code || "").trim();
+    if (direct) {
+        return direct.toUpperCase();
+    }
+    const cause = error?.cause;
+    if (cause && typeof cause === "object" && cause !== error) {
+        return readErrorCode(cause);
+    }
+    return "";
+}
+function isRetriableProviderListError(error) {
+    if (!error) {
+        return false;
+    }
+    const code = readErrorCode(error);
+    if ([
+        "ECONNRESET",
+        "ETIMEDOUT",
+        "ECONNREFUSED",
+        "EPIPE",
+        "EAI_AGAIN",
+        "ENOTFOUND",
+        "UND_ERR_CONNECT_TIMEOUT",
+        "UND_ERR_HEADERS_TIMEOUT",
+        "UND_ERR_SOCKET"
+    ].includes(code)) {
+        return true;
+    }
+    const message = String(error?.message || error || "").trim().toLowerCase();
+    return message.includes("fetch failed")
+        || message.includes("timeout after")
+        || message.includes("socket hang up")
+        || message.includes("connection reset")
+        || message.includes("network");
+}
+function retryDelayMs(baseDelayMs, attempt) {
+    const base = Math.max(100, Number(baseDelayMs || 0) || DEFAULT_MODEL_LIST_RETRY_DELAY_MS);
+    return Math.min(MAX_RETRY_DELAY_MS, base * Math.max(1, Number(attempt || 1)));
+}
 function dedupe(rows) {
     const out = [];
     const seen = new Set();
@@ -71,38 +116,85 @@ function extractProviderModels(rows) {
     }
     return output;
 }
+function normalizeConnectedProviderIds(rows) {
+    const ids = new Set();
+    const input = Array.isArray(rows) ? rows : [];
+    for (const item of input) {
+        if (typeof item === "string") {
+            const id = item.trim();
+            if (id) {
+                ids.add(id);
+            }
+            continue;
+        }
+        if (!item || typeof item !== "object") {
+            continue;
+        }
+        const id = String(item.id || "").trim();
+        if (id) {
+            ids.add(id);
+        }
+    }
+    return ids;
+}
 async function listModelsViaSdk() {
     const authHeader = getServerAuthHeader();
     const client = createOpencodeClient({
         baseUrl: config.opencodeServerUrl,
+        fetch: OPENCODE_FETCH,
         responseStyle: "data",
         throwOnError: true,
         ...(authHeader ? { headers: { Authorization: authHeader } } : {})
     });
     const startedAt = Date.now();
-    const payload = await withTimeout(client.provider.list(), MODEL_LIST_TIMEOUT_MS, "OpenCode provider.list");
+    let payload = null;
+    for (let attempt = 1; attempt <= MODEL_LIST_RETRY_ATTEMPTS; attempt += 1) {
+        try {
+            payload = await withTimeout(client.provider.list(), MODEL_LIST_TIMEOUT_MS, "OpenCode provider.list");
+            break;
+        }
+        catch (error) {
+            if (attempt >= MODEL_LIST_RETRY_ATTEMPTS || !isRetriableProviderListError(error)) {
+                throw error;
+            }
+            const delayMs = retryDelayMs(MODEL_LIST_RETRY_DELAY_MS, attempt);
+            console.warn(`[trace][model] provider.list retry attempt=${attempt}/${MODEL_LIST_RETRY_ATTEMPTS} delayMs=${delayMs} reason=${error instanceof Error ? error.message : String(error)}`);
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+    }
     const allRows = payload && typeof payload === "object" ? payload.all : [];
     const connectedRows = payload && typeof payload === "object" ? payload.connected : [];
-    const models = dedupe([
-        ...extractProviderModels(allRows),
-        ...extractProviderModels(connectedRows)
-    ]);
-    console.log(`[trace][model] listAvailableModels sdk-hit count=${models.length} elapsedMs=${Date.now() - startedAt}`);
+    const connectedIds = normalizeConnectedProviderIds(connectedRows);
+    const connectedRowsWithModels = extractProviderModels(connectedRows);
+    let models = [];
+    if (connectedRowsWithModels.length > 0) {
+        // Some SDK versions return connected as provider objects.
+        models = dedupe(connectedRowsWithModels);
+    }
+    else if (connectedIds.size > 0) {
+        // Current SDK returns connected as provider id list. Use it to filter all providers.
+        const configuredProviders = (Array.isArray(allRows) ? allRows : []).filter((provider) => {
+            if (!provider || typeof provider !== "object") {
+                return false;
+            }
+            const providerId = String(provider.id || "").trim();
+            return providerId ? connectedIds.has(providerId) : false;
+        });
+        models = dedupe(extractProviderModels(configuredProviders));
+    }
+    console.log(
+        `[trace][model] listAvailableModels sdk-hit count=${models.length} connectedProviders=${Array.isArray(connectedRows) ? connectedRows.length : 0} connectedIds=${connectedIds.size} allProviders=${Array.isArray(allRows) ? allRows.length : 0} elapsedMs=${Date.now() - startedAt}`
+    );
     return models;
 }
 export async function listAvailableModels(forceRefresh = false) {
-    const now = Date.now();
-    if (!forceRefresh && cacheRows.length > 0 && now - cacheAt < CACHE_TTL_MS) {
-        return [...cacheRows];
-    }
     try {
         const rows = await listModelsViaSdk();
-        cacheRows = rows;
-        cacheAt = now;
-        return [...cacheRows];
+        lastSuccessfulRows = rows;
+        return [...rows];
     }
     catch (error) {
         console.warn(`[trace][model] listAvailableModels sdk-error message=${error instanceof Error ? error.message : String(error)}`);
-        return [...cacheRows];
+        return [...lastSuccessfulRows];
     }
 }

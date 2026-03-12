@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { normalizeOpencodeServerUrl } from "./opencode.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(moduleDir, "..", "..");
@@ -64,7 +65,7 @@ function parsePositiveInt(raw, fallback) {
 }
 
 export const config = {
-  opencodeServerUrl: String(process.env.OPENCODE_SERVER_URL || "http://127.0.0.1:14096").replace(/\/$/, ""),
+  opencodeServerUrl: normalizeOpencodeServerUrl(process.env.OPENCODE_SERVER_URL),
   feishuAppId: String(process.env.FEISHU_APP_ID || "").trim(),
   feishuAppSecret: String(process.env.FEISHU_APP_SECRET || "").trim(),
   feishuDomain: String(process.env.FEISHU_DOMAIN || "feishu").trim().toLowerCase(),

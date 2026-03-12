@@ -12,6 +12,26 @@ function Normalize-Text {
   return $Value.ToLower().Replace("\", "/")
 }
 
+function Test-RelativeGatewayCommand {
+  param(
+    [string]$CommandLine,
+    [string]$ProcessName
+  )
+  $cmdNorm = Normalize-Text $CommandLine
+  $nameNorm = Normalize-Text $ProcessName
+  if (-not $cmdNorm) {
+    return $false
+  }
+  $isGatewayRelative = $cmdNorm.Contains("--watch gateway/main.js") `
+    -or $cmdNorm.Contains("/c node --watch gateway/main.js") `
+    -or $cmdNorm.Contains(" gateway/main.js") `
+    -or $cmdNorm.EndsWith("gateway/main.js")
+  if (-not $isGatewayRelative) {
+    return $false
+  }
+  return $nameNorm -eq "node.exe" -or $nameNorm -eq "cmd.exe"
+}
+
 function Get-ProcessMap {
   $map = @{}
   foreach ($proc in Get-CimInstance Win32_Process) {
@@ -116,7 +136,8 @@ foreach ($entry in $processMap.Values) {
     continue
   }
   $containsRoot = $cmdNorm.Contains($projectNorm)
-  if (-not $containsRoot) {
+  $isRelativeGatewayCmd = Test-RelativeGatewayCommand -CommandLine $entry.CommandLine -ProcessName $entry.Name
+  if (-not $containsRoot -and -not $isRelativeGatewayCmd) {
     continue
   }
   $isGatewayLike = $cmdNorm.Contains("gateway/main.js") `

@@ -101,14 +101,23 @@ function listEntries(targetPath) {
   const dirs = [];
   const files = [];
   const hiddenDirs = new Set([".oc_trash", ".git"]);
-  for (const entry of fs.readdirSync(targetPath, { withFileTypes: true })) {
-    const name = String(entry.name || "");
+  const names = fs.readdirSync(targetPath, { encoding: "utf8" });
+  for (const rawName of names) {
+    const name = String(rawName || "");
     if (hiddenDirs.has(name)) {
       continue;
     }
-    if (entry.isDirectory()) {
+    const fullPath = path.join(targetPath, name);
+    let stat = null;
+    try {
+      stat = fs.statSync(fullPath);
+    } catch {
+      // Entry may have been removed between readdir and stat.
+      continue;
+    }
+    if (stat.isDirectory()) {
       dirs.push(name);
-    } else if (entry.isFile()) {
+    } else if (stat.isFile()) {
       files.push(name);
     }
   }
@@ -479,6 +488,7 @@ export function createNavigationHandlers({
 
     const summary = [
       `当前目录：\`${resolved}\``,
+      `刷新时间：\`${new Date().toISOString()}\``,
       `当前工具：\`${activeTool}\``,
       `当前模型：\`${activeModel || "未设置"}\``,
       activeSession ? `当前会话：\`${activeSession}\`` : "",
@@ -594,7 +604,7 @@ export function createNavigationHandlers({
     }
     if (action === "change_model_page") {
       const page = Math.max(0, Number.parseInt(String(value?.page ?? 0), 10) || 0);
-      await showModelCard(chatId, { page });
+      await showModelCard(chatId, { page, forceRefresh: false });
       return true;
     }
     if (action === "change_tool") {
@@ -869,7 +879,7 @@ export function createNavigationHandlers({
         await sendText(chatId, "❌ 当前未绑定工作空间，无法切换模型");
         return true;
       }
-      await showModelCard(chatId);
+      await showModelCard(chatId, { page: 0, forceRefresh: true });
       return true;
     }
     if (action === "nav_tool_select") {

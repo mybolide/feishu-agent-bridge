@@ -9,6 +9,7 @@ import {
 import { getDefaultRuntimeProviderId, resolveRuntimeProvider } from "../agent-runtime/index.js";
 import { createOpenCodeProgressCard } from "../agent-runtime/opencode/progress-card.js";
 import { shouldRetryInCurrentSession, shouldRetryWithFreshSession } from "./retry-policy.js";
+import { resolveBoundSessionForRun } from "./session-policy.js";
 import {
   clearThreadModel,
   clearThreadSession,
@@ -45,22 +46,6 @@ const IFLOW_SAME_SESSION_RETRY_DELAY_MS = Math.max(
   Number.parseInt(String(process.env.IFLOW_SAME_SESSION_RETRY_DELAY_MS || 1200), 10) || 1200
 );
 
-function isSuspiciousSessionTitle(title) {
-  const value = String(title || "").trim().toLowerCase();
-  if (!value) {
-    return false;
-  }
-  return value.startsWith("diag-")
-    || value.startsWith("sdk-")
-    || value.startsWith("post-patch-")
-    || value.startsWith("progress-debug-")
-    || value.includes("subagent")
-    || value.includes("@explore")
-    || value.includes("@librarian")
-    || value.includes("debug")
-    || value.includes("test");
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms || 0))));
 }
@@ -91,20 +76,20 @@ function isIFlowSessionUnhealthy(sessionId) {
   return true;
 }
 
-function resolveReusableSession(threadId, sessions, runtimeId = "") {
+function resolveReusableSession(threadId, runtimeId = "") {
   const activeSession = getThreadSession(threadId);
-  console.log(`[trace][session] resolveReusableSession thread=${threadId} bound=${activeSession || ""} runtime=${runtimeId || ""} sessionCount=${sessions.length}`);
-  if (activeSession) {
-    if (runtimeId === "iflow-cli" && isIFlowSessionUnhealthy(activeSession)) {
-      console.warn(`[trace][iflow] skip unhealthy bound session thread=${threadId} session=${activeSession}`);
-      return "";
-    }
-    const activeRow = sessions.find((item) => item.id === activeSession);
-    if (activeRow && !isSuspiciousSessionTitle(activeRow.title)) {
-      console.log(`[trace][session] resolveReusableSession reuse-bound thread=${threadId} session=${activeRow.id} title=${JSON.stringify(String(activeRow.title || ""))}`);
-      return activeRow.id;
-    }
-    console.warn(`[trace][session] resolveReusableSession bound-session-missing-or-suspicious thread=${threadId} bound=${activeSession}`);
+  console.log(`[trace][session] resolveReusableSession thread=${threadId} bound=${activeSession || ""} runtime=${runtimeId || ""}`);
+  const reusableSession = resolveBoundSessionForRun({
+    sessionId: activeSession,
+    runtimeId,
+    unhealthy: runtimeId === "iflow-cli" && isIFlowSessionUnhealthy(activeSession)
+  });
+  if (reusableSession) {
+    console.log(`[trace][session] resolveReusableSession reuse-bound thread=${threadId} session=${reusableSession}`);
+    return reusableSession;
+  }
+  if (activeSession && runtimeId === "iflow-cli") {
+    console.warn(`[trace][iflow] skip unhealthy bound session thread=${threadId} session=${activeSession}`);
   }
   console.log(`[trace][session] resolveReusableSession no-bound-session-reused thread=${threadId}`);
   return "";
@@ -410,14 +395,15 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
     + ` command=${JSON.stringify(command.slice(0, 120))}`
   );
 
-  const sessions = await runtimeProvider.session.list(binding.repoPath);
-  console.log(`[trace][session] executeRunUnsafe listed thread=${threadId} repo=${binding.repoPath} sessions=${sessions.length} ids=${JSON.stringify(sessions.slice(0, 10).map((item) => item.id))}`);
-
-  let sessionId = resolveReusableSession(threadId, sessions, runtimeProvider.id);
+  let sessionId = resolveReusableSession(threadId, runtimeProvider.id);
   if (!sessionId) {
-    const created = await runtimeProvider.session.create(binding.repoPath, `feishu-${path.basename(binding.repoPath)}-${Date.now()}`);
-    sessionId = created.id;
-    console.log(`[trace][session] executeRunUnsafe created-new thread=${threadId} session=${sessionId} title=${JSON.stringify(String(created.title || ""))}`);
+    try {
+      const created = await runtimeProvider.session.create(binding.repoPath, `feishu-${path.basename(binding.repoPath)}-${Date.now()}`);
+      sessionId = created.id;
+      console.log(`[trace][session] executeRunUnsafe created-new thread=${threadId} session=${sessionId} title=${JSON.stringify(String(created.title || ""))}`);
+    } catch (error) {
+      throw error;
+    }
   }
 
   console.log(`[trace][session] executeRunUnsafe final-session thread=${threadId} session=${sessionId} boundBefore=${boundSessionBefore || ""}`);
@@ -718,6 +704,7 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
     console.error(`[trace][session] executeRunUnsafe failed thread=${threadId} run=${runId} session=${sessionId} boundBefore=${boundSessionBefore || ""} error=${message}`);
     console.error(`[opencode] run failed thread=${threadId} session=${sessionId} run=${runId}: ${message}`);
     patchQueuedRun(runId, { status: "failed", error: message });
+    let failureNotifiedByCard = false;
 
     if (shouldSendFeishuCard) {
       try {
@@ -730,11 +717,15 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
           allowFallbackSend: true
         });
         progressMessageId = dispatch.messageId || progressMessageId;
+        failureNotifiedByCard = true;
       } catch (sendError) {
         console.error("[opencode] failed to dispatch failed card", sendError);
       }
     }
 
+    if (error && typeof error === "object") {
+      error.__feishuUserNotified = failureNotifiedByCard;
+    }
     throw error;
   } finally {
     clearRunAbortController(runId);
