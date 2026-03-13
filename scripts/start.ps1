@@ -159,6 +159,83 @@ function Get-OpenCodeCandidateUrls {
   return @($results)
 }
 
+function Test-LoopbackHost {
+  param([string]$HostName)
+  $normalized = [string]$HostName
+  if (-not $normalized) {
+    return $false
+  }
+  return @("127.0.0.1", "localhost", "::1") -contains $normalized.ToLower()
+}
+
+function Get-PortOwnerProcessIds {
+  param([int]$TargetPort)
+  try {
+    return @(
+      Get-NetTCPConnection -LocalPort $TargetPort -ErrorAction Stop |
+        Select-Object -ExpandProperty OwningProcess -Unique |
+        Where-Object { $_ -and $_ -gt 0 }
+    )
+  } catch {
+    return @()
+  }
+}
+
+function Get-ProcessRowById {
+  param([int]$ProcessId)
+  try {
+    return Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop | Select-Object -First 1
+  } catch {
+    return $null
+  }
+}
+
+function Get-ProcessChain {
+  param(
+    [int]$ProcessId,
+    [int]$MaxDepth = 10
+  )
+  $rows = [System.Collections.Generic.List[object]]::new()
+  $seen = [System.Collections.Generic.HashSet[int]]::new()
+  $currentId = [int]$ProcessId
+
+  for ($depth = 0; $depth -lt [Math]::Max(1, $MaxDepth); $depth++) {
+    if ($currentId -le 0) {
+      break
+    }
+    if (-not $seen.Add($currentId)) {
+      break
+    }
+    $row = Get-ProcessRowById -ProcessId $currentId
+    if (-not $row) {
+      break
+    }
+    $rows.Add($row)
+    $parentId = [int]$row.ParentProcessId
+    if ($parentId -le 0 -or $parentId -eq $currentId) {
+      break
+    }
+    $currentId = $parentId
+  }
+
+  return @($rows)
+}
+
+function Test-IsOpenCodeProcessRow {
+  param($Row)
+  if (-not $Row) {
+    return $false
+  }
+  $name = [string]$Row.Name
+  $commandLine = [string]$Row.CommandLine
+  $nameNorm = $name.ToLower()
+  $cmdNorm = $commandLine.ToLower()
+  if ($nameNorm -eq "opencode.exe") {
+    return $true
+  }
+  return $cmdNorm.Contains("opencode") -and $cmdNorm.Contains(" serve")
+}
+
 function Resolve-HealthyOpenCodeServerUrl {
   param(
     [string]$ServerUrl,
@@ -174,14 +251,80 @@ function Resolve-HealthyOpenCodeServerUrl {
   return ""
 }
 
+function Stop-OpenCodeProcessesOnPort {
+  param([int]$TargetPort, [string]$Reason = "restart")
+  $ownerPids = Get-PortOwnerProcessIds -TargetPort $TargetPort
+  if ($ownerPids.Count -eq 0) {
+    return $false
+  }
+
+  $rootPids = [System.Collections.Generic.HashSet[int]]::new()
+  foreach ($ownerPid in $ownerPids) {
+    $chain = Get-ProcessChain -ProcessId $ownerPid
+    $matchingRows = @($chain | Where-Object { Test-IsOpenCodeProcessRow -Row $_ })
+    if ($matchingRows.Count -gt 0) {
+      $rootPid = [int]$matchingRows[-1].ProcessId
+      if ($rootPid -gt 0 -and $rootPid -ne $PID) {
+        [void]$rootPids.Add($rootPid)
+      }
+    }
+  }
+
+  if ($rootPids.Count -eq 0) {
+    return $false
+  }
+
+  foreach ($rootPid in @($rootPids | Sort-Object -Descending)) {
+    try {
+      & cmd.exe /c "taskkill /PID $rootPid /T /F" | Out-Null
+      Write-Host "[start] killed OpenCode process tree $rootPid on port $TargetPort ($Reason)"
+    } catch {
+      Write-Warning "[start] failed to kill OpenCode tree pid=$rootPid on port ${TargetPort}: $($_.Exception.Message)"
+    }
+  }
+
+  Start-Sleep -Milliseconds 800
+  return $true
+}
+
+function Resolve-OpenCodeRestartServerUrl {
+  param(
+    [string]$ServerUrl,
+    [int]$ScanLimit = 40
+  )
+  $candidates = Get-OpenCodeCandidateUrls -ServerUrl $ServerUrl -ScanLimit $ScanLimit
+  foreach ($candidate in $candidates) {
+    try {
+      $uri = [System.Uri]$candidate
+    } catch {
+      continue
+    }
+    $hostName = if ($uri.Host) { $uri.Host } else { "127.0.0.1" }
+    $targetPort = if ($uri.Port -gt 0) { $uri.Port } else { 24096 }
+    if (-not (Test-LoopbackHost -HostName $hostName)) {
+      continue
+    }
+
+    if (-not (Test-TcpPort -HostName $hostName -TargetPort $targetPort)) {
+      return $candidate
+    }
+
+    if (Stop-OpenCodeProcessesOnPort -TargetPort $targetPort -Reason "restarting stale OpenCode server") {
+      if (-not (Test-TcpPort -HostName $hostName -TargetPort $targetPort)) {
+        Write-Host "[start] reclaimed OpenCode port $targetPort for a fresh server start"
+        return $candidate
+      }
+    }
+
+    Write-Warning "[start] OpenCode candidate $candidate is occupied by a non-OpenCode process; trying next port"
+  }
+
+  return ""
+}
+
 function Stop-ProcessesOnPort {
   param([int]$TargetPort, [string]$Reason = "restart")
-  $rows = @()
-  try {
-    $rows = Get-NetTCPConnection -LocalPort $TargetPort -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique
-  } catch {
-    $rows = @()
-  }
+  $rows = Get-PortOwnerProcessIds -TargetPort $TargetPort
   foreach ($procId in @($rows)) {
     if ($procId -and $procId -ne $PID) {
       try {
@@ -360,7 +503,24 @@ if (-not $SkipOpenCodeServer) {
   } catch {
     $scanLimit = 40
   }
-  $existingHealthyServerUrl = Resolve-HealthyOpenCodeServerUrl -ServerUrl $serverUrl -ScanLimit $scanLimit -TimeoutMs 2500
+  $isLoopbackServer = $false
+  try {
+    $serverUri = [System.Uri]$serverUrl
+    $isLoopbackServer = Test-LoopbackHost -HostName $serverUri.Host
+  } catch {
+    $isLoopbackServer = $true
+  }
+  $restartServerUrl = ""
+  if ($isLoopbackServer) {
+    $restartServerUrl = Resolve-OpenCodeRestartServerUrl -ServerUrl $serverUrl -ScanLimit $scanLimit
+    if ($restartServerUrl) {
+      $serverUrl = $restartServerUrl
+    }
+  }
+  $existingHealthyServerUrl = ""
+  if (-not $restartServerUrl) {
+    $existingHealthyServerUrl = Resolve-HealthyOpenCodeServerUrl -ServerUrl $serverUrl -ScanLimit $scanLimit -TimeoutMs 2500
+  }
   if ($existingHealthyServerUrl) {
     $env:OPENCODE_SERVER_URL = $existingHealthyServerUrl
     Write-Host "[start] OpenCode server already healthy at $existingHealthyServerUrl"

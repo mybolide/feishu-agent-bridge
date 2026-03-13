@@ -19,6 +19,7 @@ import {
   getRunRef,
   getThreadSession,
   getThreadTool,
+  latestQueuedRunForThread,
   patchQueuedRun,
   patchRunRef,
   reconcileQueuedRunsOnStartup,
@@ -45,6 +46,7 @@ const IFLOW_SAME_SESSION_RETRY_DELAY_MS = Math.max(
   300,
   Number.parseInt(String(process.env.IFLOW_SAME_SESSION_RETRY_DELAY_MS || 1200), 10) || 1200
 );
+const QUEUED_COMMAND_PREVIEW_MAX_CHARS = 120;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms || 0))));
@@ -103,6 +105,26 @@ function isFeishuThreadTarget(threadId) {
   return /^(oc_|ou_|on_|chat:|group:|user:|open_id:|feishu:|lark:)/i.test(value) || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
+function summarizeQueuedCommand(command) {
+  const value = String(command || "").replace(/\s+/g, " ").trim();
+  if (!value) {
+    return "";
+  }
+  return value.length > QUEUED_COMMAND_PREVIEW_MAX_CHARS
+    ? `${value.slice(0, QUEUED_COMMAND_PREVIEW_MAX_CHARS)}...`
+    : value;
+}
+
+function appendQueuedRunHint(detail, queuedRun) {
+  const base = String(detail || "").trim();
+  const followUp = summarizeQueuedCommand(queuedRun?.pendingFollowUpCommand);
+  if (!followUp) {
+    return base;
+  }
+  const note = `收到新消息，待当前任务完成后继续：${followUp}`;
+  return base ? `${base}\n\n${note}` : note;
+}
+
 function isRunAborted(runId) {
   return getQueuedRun(runId)?.status === "aborted";
 }
@@ -143,7 +165,7 @@ export function requestRunAbort(runId, reason = "abort requested") {
   return true;
 }
 
-function startProgressHeartbeat({ threadId, command, getMessageId, getDetail }) {
+function startProgressHeartbeat({ runId, threadId, command, getMessageId, getDetail }) {
   const startedAt = Date.now();
   let stopped = false;
   let inflight = Promise.resolve();
@@ -154,13 +176,16 @@ function startProgressHeartbeat({ threadId, command, getMessageId, getDetail }) 
       return;
     }
     const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
-    const detail = typeof getDetail === "function"
+    const queuedRun = getQueuedRun(runId);
+    const detail = appendQueuedRunHint(typeof getDetail === "function"
       ? String(getDetail() || "").trim()
-      : "";
+      : "", queuedRun);
+    const latestOutput = String(queuedRun?.latestOutput || "").trim();
     await dispatchInteractiveCard(threadId, createOpenCodeProgressCard({
       status: "running",
       elapsedSeconds,
-      detail: detail || `命令：${command}`
+      detail: detail || `命令：${command}`,
+      latestOutput
     }), {
       messageId,
       allowFallbackSend: false
@@ -233,6 +258,34 @@ function buildRunContextDetail(command, repoPath, streamPreview = "") {
     parts.push(preview);
   }
   return parts.join("\n\n");
+}
+
+export function mergeProgressOutput(previousOutput, previousRawText, nextRawText) {
+  const previous = String(previousOutput || "").trim();
+  const previousRaw = String(previousRawText || "").trim();
+  const next = String(nextRawText || "").trim();
+  if (!next) {
+    return previous;
+  }
+  if (!previous) {
+    return next;
+  }
+  if (next === previousRaw) {
+    return previous;
+  }
+  if (previousRaw && next.startsWith(previousRaw) && previous.endsWith(previousRaw)) {
+    return `${previous.slice(0, previous.length - previousRaw.length)}${next}`.trim();
+  }
+  if (previous.endsWith(next) || previous.includes(`\n\n${next}`)) {
+    return previous;
+  }
+  return `${previous}\n\n${next}`.trim();
+}
+
+function resolveFinalOutput(output, latestOutput) {
+  const finalText = String(output || "").trim();
+  const progressText = String(latestOutput || "").trim();
+  return finalText || progressText || "";
 }
 
 function buildRuntimeInput(command, repoPath) {
@@ -357,6 +410,48 @@ export function bindThread(threadId, repoPathRaw, branch) {
 
 export async function executeRun(threadId, command, model, toolId = "") {
   const prev = THREAD_RUN_CHAINS.get(threadId) || Promise.resolve();
+  const hasActiveChain = THREAD_RUN_CHAINS.has(threadId);
+  if (hasActiveChain) {
+    const activeRun = latestQueuedRunForThread(threadId, ["running", "pending"]);
+    if (activeRun?.runId) {
+      const pendingFollowUpCommand = String(command || "").trim();
+      patchQueuedRun(activeRun.runId, {
+        pendingFollowUpCommand,
+        updatedAt: Date.now()
+      });
+      if (isFeishuThreadTarget(threadId)) {
+        const progressMessageId = String(activeRun.progressMessageId || "").trim();
+        const elapsedSeconds = Math.max(0, Math.floor((Date.now() - Number(activeRun.createdAt || Date.now())) / 1000));
+        const detail = appendQueuedRunHint(
+          buildRunContextDetail(activeRun.command, activeRun.directory),
+          { pendingFollowUpCommand }
+        );
+        const latestOutput = String(activeRun.latestOutput || "").trim();
+        Promise.resolve().then(async () => {
+          try {
+            if (progressMessageId) {
+              await dispatchInteractiveCard(threadId, createOpenCodeProgressCard({
+                status: "running",
+                elapsedSeconds,
+                detail,
+                latestOutput
+              }), {
+                messageId: progressMessageId,
+                allowFallbackSend: false
+              });
+            } else {
+              await sendText(
+                threadId,
+                `ℹ️ 上一轮仍在执行，已收到你的新消息并排队：${summarizeQueuedCommand(pendingFollowUpCommand)}`
+              );
+            }
+          } catch (error) {
+            console.warn(`[trace][session] pending-followup notify failed thread=${threadId}`, error);
+          }
+        });
+      }
+    }
+  }
   const current = prev
     .catch(() => undefined)
     .then(() => executeRunUnsafe(threadId, command, model, toolId));
@@ -433,6 +528,8 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
     toolId: runtimeProvider.id,
     sessionId,
     progressMessageId: "",
+    latestOutput: "",
+    pendingFollowUpCommand: "",
     status: "running",
     createdAt: runStartedAt,
     updatedAt: runStartedAt
@@ -462,6 +559,7 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
         patchRunRef(runId, { progressMessageId });
         patchQueuedRun(runId, { progressMessageId });
         stopProgressHeartbeat = startProgressHeartbeat({
+          runId,
           threadId,
           command,
           getMessageId: () => progressMessageId,
@@ -491,16 +589,23 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
         return;
       }
     }
-    const preview = value.length > STREAM_PROGRESS_PREVIEW_MAX_CHARS
-      ? `...${value.slice(-STREAM_PROGRESS_PREVIEW_MAX_CHARS)}`
-      : value;
+    const mergedOutput = mergeProgressOutput(
+      String(getQueuedRun(runId)?.latestOutput || ""),
+      lastStreamText,
+      value
+    );
+    const preview = mergedOutput.length > STREAM_PROGRESS_PREVIEW_MAX_CHARS
+      ? `...${mergedOutput.slice(-STREAM_PROGRESS_PREVIEW_MAX_CHARS)}`
+      : mergedOutput;
     liveProgressDetail = buildRunContextDetail(command, binding.repoPath, preview);
     lastStreamText = value;
     lastStreamUpdateAt = now;
+    patchQueuedRun(runId, { latestOutput: mergedOutput, updatedAt: now });
     await dispatchInteractiveCard(threadId, createOpenCodeProgressCard({
       status: "running",
       elapsedSeconds: Math.floor((Date.now() - runStartedAt) / 1000),
-      detail: liveProgressDetail
+      detail: appendQueuedRunHint(liveProgressDetail, getQueuedRun(runId)),
+      latestOutput: mergedOutput
     }), {
       messageId: progressMessageId,
       allowFallbackSend: false
@@ -563,7 +668,8 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
             await dispatchInteractiveCard(threadId, createOpenCodeProgressCard({
               status: "running",
               elapsedSeconds: Math.floor((Date.now() - runStartedAt) / 1000),
-              detail: liveProgressDetail
+              detail: liveProgressDetail,
+              latestOutput: String(getQueuedRun(runId)?.latestOutput || "").trim()
             }), {
               messageId: progressMessageId,
               allowFallbackSend: false
@@ -609,7 +715,8 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
           await dispatchInteractiveCard(threadId, createOpenCodeProgressCard({
             status: "running",
             elapsedSeconds: Math.floor((Date.now() - runStartedAt) / 1000),
-            detail: liveProgressDetail
+            detail: liveProgressDetail,
+            latestOutput: String(getQueuedRun(runId)?.latestOutput || "").trim()
           }), {
             messageId: progressMessageId,
             allowFallbackSend: false
@@ -647,9 +754,10 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
     }
 
     patchQueuedRun(runId, { status: "completed" });
+    const latestOutput = String(getQueuedRun(runId)?.latestOutput || "").trim();
+    const finalOutput = resolveFinalOutput(output, latestOutput);
 
     if (shouldSendFeishuCard) {
-      const finalOutput = output || "(task completed without text output)";
       const resultCard = buildTaskResultNavigatorCard(binding.repoPath, finalOutput, {
         run_id: runId,
         route: runtimeProvider.id,
@@ -667,7 +775,7 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
     return {
       runId,
       sessionId: activeSessionId,
-      output: output || "(task completed without text output)",
+      output: finalOutput,
       repoPath: binding.repoPath
     };
   } catch (error) {

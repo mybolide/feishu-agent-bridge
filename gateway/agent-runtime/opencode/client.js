@@ -13,9 +13,11 @@ import {
   withTimeout
 } from "./client-core.js";
 import {
+  extractQuestionRequestId,
   extractMessageCreatedAt,
   extractMessageId,
   extractTextFromParts,
+  fetchPendingQuestionsWithRetry,
   fetchSessionMessagesWithRetry,
   messageRole,
   normalizeModelPayload,
@@ -25,6 +27,97 @@ import {
 import { startAssistantProgressPump } from "./progress-pump.js";
 
 export { isAbortLikeError } from "./client-core.js";
+
+function normalizeQuestionOptions(question) {
+  return (Array.isArray(question?.options) ? question.options : [])
+    .map((option) => ({
+      label: String(option?.label || "").trim(),
+      description: String(option?.description || "").trim()
+    }))
+    .filter((option) => option.label);
+}
+
+export function findLatestPendingQuestionRequest(rows, sessionId = "") {
+  const targetSessionId = String(sessionId || "").trim();
+  for (let i = (Array.isArray(rows) ? rows.length : 0) - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    const requestId = extractQuestionRequestId(row);
+    if (!requestId) {
+      continue;
+    }
+    if (targetSessionId && String(row?.sessionID || "").trim() !== targetSessionId) {
+      continue;
+    }
+    return row;
+  }
+  return null;
+}
+
+export function buildQuestionReplyAnswers(request, rawText) {
+  const text = String(rawText || "").trim();
+  if (!text) {
+    return null;
+  }
+  const normalizedText = text.toLowerCase();
+  const questions = Array.isArray(request?.questions) ? request.questions : [];
+  if (questions.length === 0) {
+    return [];
+  }
+  const answers = [];
+  for (const question of questions) {
+    const options = normalizeQuestionOptions(question);
+    const matched = options.filter((option) => normalizedText.includes(option.label.toLowerCase()));
+    if (matched.length > 0) {
+      answers.push(matched.map((option) => option.label));
+      continue;
+    }
+    if (questions.length === 1 && question?.custom !== false) {
+      answers.push([text]);
+      continue;
+    }
+    return null;
+  }
+  return answers;
+}
+
+async function resolvePendingQuestion(client, directory, sessionId, text, questionRows, requestOptions = {}) {
+  const pendingRequest = findLatestPendingQuestionRequest(questionRows, sessionId);
+  if (!pendingRequest) {
+    return null;
+  }
+  const requestId = extractQuestionRequestId(pendingRequest);
+  if (!requestId) {
+    return null;
+  }
+  const answers = buildQuestionReplyAnswers(pendingRequest, text);
+  if (answers && typeof client?.question?.reply === "function") {
+    await withTimeout(client.question.reply({
+      requestID: requestId,
+      directory,
+      answers
+    }, requestOptions), REQUEST_TIMEOUT_MS, `OpenCode question.reply request=${requestId}`, requestOptions);
+    console.log(`[trace][session] sendMessageToSession question-replied directory=${directory} session=${sessionId} request=${requestId} answers=${JSON.stringify(answers)}`);
+    return {
+      mode: "reply",
+      requestId
+    };
+  }
+  if (typeof client?.question?.reject === "function") {
+    await withTimeout(client.question.reject({
+      requestID: requestId,
+      directory
+    }, requestOptions), REQUEST_TIMEOUT_MS, `OpenCode question.reject request=${requestId}`, requestOptions);
+    console.log(`[trace][session] sendMessageToSession question-rejected directory=${directory} session=${sessionId} request=${requestId}`);
+    return {
+      mode: "reject",
+      requestId
+    };
+  }
+  return {
+    mode: "unresolved",
+    requestId
+  };
+}
 
 export async function listSessions(directory) {
   const normalizedDir = normalizeDirectory(directory);
@@ -85,6 +178,11 @@ export async function sendMessageToSession(directory, sessionId, text, model, op
   const seenAssistantIds = new Set(baselineRows
     .filter((item) => messageRole(item) === "assistant")
     .map((item) => extractMessageId(item))
+    .filter(Boolean));
+  const baselineQuestionRows = await fetchPendingQuestionsWithRetry(client, normalizedDir, requestOptions, { maxAttempts: 1 });
+  const seenQuestionIds = new Set(baselineQuestionRows
+    .filter((item) => String(item?.sessionID || "").trim() === sessionId)
+    .map((item) => extractQuestionRequestId(item))
     .filter(Boolean));
   const sinceCreatedAt = baselineRows.reduce((max, item) => Math.max(max, extractMessageCreatedAt(item)), 0);
   const onProgress = typeof options?.onProgress === "function" ? options.onProgress : null;
@@ -149,8 +247,21 @@ export async function sendMessageToSession(directory, sessionId, text, model, op
   );
   promptStartedAt = Date.now();
   try {
+    const pendingQuestion = await resolvePendingQuestion(
+      client,
+      normalizedDir,
+      sessionId,
+      text,
+      baselineQuestionRows,
+      requestOptions
+    );
+    if (pendingQuestion?.requestId) {
+      seenQuestionIds.add(pendingQuestion.requestId);
+    }
     let syncOutput = "";
-    if (typeof client?.session?.promptAsync === "function") {
+    if (pendingQuestion?.mode === "reply") {
+      console.log(`[trace][session] sendMessageToSession wait-after-question-reply directory=${normalizedDir} session=${sessionId} sinceCreatedAt=${sinceCreatedAt}`);
+    } else if (typeof client?.session?.promptAsync === "function") {
       await withTimeout(client.session.promptAsync(payload, requestOptions), REQUEST_TIMEOUT_MS, `OpenCode session.prompt_async session=${sessionId}`, requestOptions);
       console.log(`[trace][session] sendMessageToSession prompt-accepted directory=${normalizedDir} session=${sessionId} elapsedMs=${Date.now() - promptStartedAt}`);
     } else {
@@ -171,6 +282,7 @@ export async function sendMessageToSession(directory, sessionId, text, model, op
       sessionId,
       sinceCreatedAt,
       seenAssistantIds,
+      seenQuestionIds,
       { ...requestOptions, progressState }
     );
     if (progressCallback && waitedOutput) {

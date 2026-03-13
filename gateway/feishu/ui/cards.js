@@ -11,6 +11,8 @@ function normalizeMarkdownForFeishu(text) {
   return value;
 }
 
+const RESULT_CARD_MAX_CHARS = 12000;
+
 function buildMarkdownCard(markdown, title = "") {
   const body = {
     schema: "2.0",
@@ -63,7 +65,9 @@ export function buildTaskResultNavigatorCard(targetPath, taskOutput, taskFeedbac
   const _ignored = { targetPath, taskFeedback };
   void _ignored;
   const preview = String(taskOutput || "").trim() || "(无输出)";
-  const cardContent = preview.length > 5000 ? `${preview.slice(0, 5000)}\n\n...(已截断)` : preview;
+  const cardContent = preview.length > RESULT_CARD_MAX_CHARS
+    ? `${preview.slice(0, RESULT_CARD_MAX_CHARS)}\n\n...(已截断)`
+    : preview;
   return buildMarkdownCard(normalizeMarkdownForFeishu(cardContent));
 }
 

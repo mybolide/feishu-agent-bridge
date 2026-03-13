@@ -29,6 +29,10 @@ export function extractMessageId(item) {
   return String(info.id || item?.id || "").trim();
 }
 
+export function extractQuestionRequestId(item) {
+  return String(item?.id || "").trim();
+}
+
 export function extractMessageCreatedAt(item) {
   const info = extractMessageInfo(item);
   const time = info.time;
@@ -53,9 +57,45 @@ function extractMessageCompletedAt(item) {
   return 0;
 }
 
+function extractMessageFinish(item) {
+  const info = extractMessageInfo(item);
+  return String(info.finish || item?.finish || "").trim().toLowerCase();
+}
+
+function isTerminalAssistantMessage(candidate) {
+  if (!candidate?.completed) {
+    return false;
+  }
+  return candidate.finish !== "tool-calls";
+}
+
+function isDisplayCompleteAssistantMessage(candidate) {
+  if (!candidate || typeof candidate !== "object") {
+    return false;
+  }
+  if (candidate.terminal) {
+    return true;
+  }
+  return candidate.finish === "stop" && Boolean(String(candidate.text || "").trim());
+}
+
 export function messageRole(item) {
   const info = extractMessageInfo(item);
   return String(info.role || "").trim().toLowerCase();
+}
+
+function extractToolText(item) {
+  if (!item || typeof item !== "object" || String(item.type || "") !== "tool") {
+    return "";
+  }
+  const state = item.state && typeof item.state === "object" ? item.state : {};
+  const title = String(state.title || "").trim();
+  const filePath = String(state?.input?.filePath || state?.metadata?.filepath || state?.input?.path || "").trim();
+  const command = String(state?.input?.command || "").trim();
+  const description = String(state?.input?.description || state?.metadata?.description || "").trim();
+  const output = String(state?.output || state?.metadata?.output || "").replace(/\r\n/g, "\n").trim();
+  const label = title || filePath || description || command || String(item.tool || "").trim();
+  return [label, output].filter(Boolean).join("\n\n").trim();
 }
 
 export function extractTextFromParts(parts) {
@@ -67,14 +107,26 @@ export function extractTextFromParts(parts) {
     if (!item || typeof item !== "object") {
       continue;
     }
-    if (String(item.type || "") === "text" && typeof item.text === "string") {
-      chunks.push(item.text);
+    const type = String(item.type || "").trim();
+    if ((type === "text" || type === "reasoning") && typeof item.text === "string") {
+      const text = item.text.trim();
+      if (text) {
+        chunks.push(text);
+      }
+      continue;
+    }
+    if (type === "tool") {
+      const toolText = extractToolText(item);
+      if (toolText) {
+        chunks.push(toolText);
+      }
     }
   }
-  return chunks.join("").trim();
+  return chunks.join("\n\n").trim();
 }
 
 function latestAssistantMessage(rows, sinceCreatedAt = 0, seenMessageIds = new Set()) {
+  let fallback = null;
   for (let i = rows.length - 1; i >= 0; i -= 1) {
     const row = rows[i];
     if (messageRole(row) !== "assistant") {
@@ -90,20 +142,154 @@ function latestAssistantMessage(rows, sinceCreatedAt = 0, seenMessageIds = new S
     }
     const text = extractTextFromParts(row.parts);
     const completedAt = extractMessageCompletedAt(row);
-    return {
+    const finish = extractMessageFinish(row);
+    const candidate = {
       id: messageId,
       text,
       createdAt,
       completedAt,
-      completed: completedAt > 0
+      completed: completedAt > 0,
+      finish,
+      terminal: isTerminalAssistantMessage({
+        completed: completedAt > 0,
+        finish
+      })
     };
+    if (candidate.terminal || candidate.text) {
+      return candidate;
+    }
+    if (!fallback) {
+      fallback = candidate;
+    }
+  }
+  return fallback;
+}
+
+function latestAssistantText(rows, sinceCreatedAt = 0, seenMessageIds = new Set()) {
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (messageRole(row) !== "assistant") {
+      continue;
+    }
+    const messageId = extractMessageId(row);
+    if (messageId && seenMessageIds.has(messageId)) {
+      continue;
+    }
+    const createdAt = extractMessageCreatedAt(row);
+    if (createdAt < sinceCreatedAt) {
+      continue;
+    }
+    const text = extractTextFromParts(row.parts);
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function resolveAssistantSnapshotText(latestMessage, visibleText) {
+  const directText = String(latestMessage?.text || "").trim();
+  if (directText) {
+    return directText;
+  }
+  return String(visibleText || "").trim();
+}
+
+function buildAssistantSnapshotKey(snapshot) {
+  const text = String(snapshot?.text || "").trim();
+  return JSON.stringify({
+    messageId: String(snapshot?.messageId || ""),
+    requestId: String(snapshot?.requestId || ""),
+    finish: String(snapshot?.messageFinish || ""),
+    completed: Boolean(snapshot?.messageCompleted),
+    terminal: Boolean(snapshot?.messageTerminal),
+    hasQuestion: Boolean(snapshot?.hasQuestion),
+    text: text.slice(-160)
+  });
+}
+
+export function computeAssistantWaitDeadline(startedAt, progressState = null, activityState = null) {
+  const baseDeadline = Number(startedAt || 0) + MESSAGE_POLL_TIMEOUT_MS;
+  const firstProgressAt = Number(progressState?.firstProgressAt || 0);
+  const lastProgressAt = Number(progressState?.lastProgressAt || 0);
+  const lastObservedAt = Number(activityState?.lastObservedAt || 0);
+  const lastActivityAt = Math.max(firstProgressAt, lastProgressAt, lastObservedAt, 0);
+  if (WAIT_FOREVER_AFTER_PROGRESS && firstProgressAt > 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+  if (lastActivityAt > 0) {
+    return Math.max(baseDeadline, lastActivityAt + MESSAGE_POLL_TIMEOUT_MS);
+  }
+  return baseDeadline;
+}
+
+function normalizeQuestionRows(rawRows) {
+  return Array.isArray(rawRows) ? rawRows.filter((item) => !!item && typeof item === "object") : [];
+}
+
+function latestPendingQuestion(rows, sessionId = "", seenQuestionIds = new Set()) {
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    const requestId = extractQuestionRequestId(row);
+    if (!requestId || seenQuestionIds.has(requestId)) {
+      continue;
+    }
+    if (sessionId && String(row?.sessionID || "").trim() !== sessionId) {
+      continue;
+    }
+    return row;
   }
   return null;
 }
 
-function latestAssistantText(rows, sinceCreatedAt = 0, seenMessageIds = new Set()) {
-  const latest = latestAssistantMessage(rows, sinceCreatedAt, seenMessageIds);
-  return String(latest?.text || "");
+export function formatQuestionRequestText(request) {
+  const questions = Array.isArray(request?.questions) ? request.questions : [];
+  const lines = [];
+  for (let index = 0; index < questions.length; index += 1) {
+    const item = questions[index];
+    const question = String(item?.question || "").trim();
+    const header = String(item?.header || "").trim();
+    const labels = (Array.isArray(item?.options) ? item.options : [])
+      .map((option) => String(option?.label || "").trim())
+      .filter(Boolean);
+    const title = header && question && header !== question
+      ? `${header}: ${question}`
+      : (question || header);
+    if (title) {
+      lines.push(`${index + 1}. ${title}`);
+    }
+    if (labels.length > 0) {
+      lines.push(`选项: ${labels.join(" / ")}`);
+    }
+  }
+  return lines.join("\n").trim();
+}
+
+function combineAssistantSnapshot(text, questionText) {
+  const chunks = [String(text || "").trim(), String(questionText || "").trim()].filter(Boolean);
+  return chunks.join("\n\n").trim();
+}
+
+export function readLatestAssistantResponse(rows, questionRows, sessionId = "", sinceCreatedAt = 0, seenMessageIds = new Set(), seenQuestionIds = new Set()) {
+  const latestMessage = latestAssistantMessage(rows, sinceCreatedAt, seenMessageIds);
+  const latestVisibleText = latestAssistantText(rows, sinceCreatedAt, seenMessageIds);
+  const latestQuestion = latestPendingQuestion(questionRows, sessionId, seenQuestionIds);
+  const latestText = resolveAssistantSnapshotText(latestMessage, latestVisibleText);
+  const questionText = latestQuestion ? formatQuestionRequestText(latestQuestion) : "";
+  const messageDisplayComplete = isDisplayCompleteAssistantMessage({
+    ...latestMessage,
+    text: latestText
+  });
+  return {
+    messageId: String(latestMessage?.id || ""),
+    requestId: String(latestQuestion?.id || ""),
+    text: combineAssistantSnapshot(latestText, questionText),
+    completed: Boolean(questionText || messageDisplayComplete),
+    hasQuestion: Boolean(questionText),
+    messageCompleted: Boolean(latestMessage?.completed),
+    messageTerminal: Boolean(messageDisplayComplete),
+    messageFinish: String(latestMessage?.finish || "")
+  };
 }
 
 export function normalizeEventPayload(raw) {
@@ -163,6 +349,19 @@ async function fetchSessionMessages(client, directory, sessionId, requestOptions
   return Array.isArray(rows) ? rows.filter((item) => !!item && typeof item === "object") : [];
 }
 
+async function fetchPendingQuestions(client, directory, requestOptions = {}) {
+  if (requestOptions?.signal?.aborted) {
+    throw createAbortError("OpenCode question.list aborted");
+  }
+  if (typeof client?.question?.list !== "function") {
+    return [];
+  }
+  const rows = await withTimeout(client.question.list({
+    directory
+  }, requestOptions), REQUEST_TIMEOUT_MS, `OpenCode question.list directory=${directory}`, requestOptions);
+  return normalizeQuestionRows(rows);
+}
+
 export async function fetchSessionMessagesWithRetry(client, directory, sessionId, requestOptions = {}, options = {}) {
   const maxAttempts = Math.max(1, Number(options?.maxAttempts || 0) || SESSION_MESSAGES_RETRY_ATTEMPTS);
   const baseDelayMs = Math.max(100, Number(options?.retryDelayMs || 0) || SESSION_MESSAGES_RETRY_DELAY_MS);
@@ -184,30 +383,51 @@ export async function fetchSessionMessagesWithRetry(client, directory, sessionId
   return [];
 }
 
-export async function waitForAssistantMessage(client, directory, sessionId, sinceCreatedAt = 0, seenMessageIds = new Set(), requestOptions = {}) {
+export async function fetchPendingQuestionsWithRetry(client, directory, requestOptions = {}, options = {}) {
+  const maxAttempts = Math.max(1, Number(options?.maxAttempts || 0) || SESSION_MESSAGES_RETRY_ATTEMPTS);
+  const baseDelayMs = Math.max(100, Number(options?.retryDelayMs || 0) || SESSION_MESSAGES_RETRY_DELAY_MS);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (requestOptions?.signal?.aborted) {
+      throw createAbortError(`OpenCode question.list directory=${directory} aborted`);
+    }
+    try {
+      return await fetchPendingQuestions(client, directory, requestOptions);
+    } catch (error) {
+      if (attempt >= maxAttempts || !isRetriableSessionReadError(error)) {
+        throw error;
+      }
+      const delayMs = retryDelayMs(baseDelayMs, attempt);
+      console.warn(`[trace][session] question.list retry directory=${directory} attempt=${attempt}/${maxAttempts} delayMs=${delayMs} reason=${String(error?.message || error)}`);
+      await sleep(delayMs);
+    }
+  }
+  return [];
+}
+
+export async function waitForAssistantMessage(client, directory, sessionId, sinceCreatedAt = 0, seenMessageIds = new Set(), seenQuestionIds = new Set(), requestOptions = {}) {
   const startedAt = Date.now();
-  const baseDeadline = startedAt + MESSAGE_POLL_TIMEOUT_MS;
   const progressState = requestOptions?.progressState && typeof requestOptions.progressState === "object"
     ? requestOptions.progressState
     : null;
+  const activityState = {
+    lastObservedAt: startedAt,
+    lastSnapshotKey: ""
+  };
   let waitForeverLogged = false;
   const resolveDeadline = () => {
     const firstProgressAt = Number(progressState?.firstProgressAt || 0);
-    if (WAIT_FOREVER_AFTER_PROGRESS && Number.isFinite(firstProgressAt) && firstProgressAt > 0) {
-      if (!waitForeverLogged) {
-        waitForeverLogged = true;
-        console.log(`[trace][session] waitForAssistantMessage wait-forever enabled directory=${directory} session=${sessionId}`);
-      }
-      return Number.POSITIVE_INFINITY;
+    if (WAIT_FOREVER_AFTER_PROGRESS && Number.isFinite(firstProgressAt) && firstProgressAt > 0 && !waitForeverLogged) {
+      waitForeverLogged = true;
+      console.log(
+        `[trace][session] waitForAssistantMessage wait-forever enabled directory=${directory}`
+        + ` session=${sessionId}`
+      );
     }
-    const lastProgressAt = Number(progressState?.lastProgressAt || 0);
-    if (!Number.isFinite(lastProgressAt) || lastProgressAt <= 0) {
-      return baseDeadline;
-    }
-    return Math.max(baseDeadline, lastProgressAt + MESSAGE_POLL_TIMEOUT_MS);
+    return computeAssistantWaitDeadline(startedAt, progressState, activityState);
   };
   let polls = 0;
   let transientFailures = 0;
+  let latestSnapshot = null;
   while (Date.now() <= resolveDeadline()) {
     if (requestOptions?.signal?.aborted) {
       throw createAbortError("OpenCode waitForAssistantMessage aborted");
@@ -232,8 +452,23 @@ export async function waitForAssistantMessage(client, directory, sessionId, sinc
       continue;
     }
     polls += 1;
-    const output = latestAssistantText(rows, sinceCreatedAt, seenMessageIds);
-    if (output) {
+    let questionRows = [];
+    try {
+      questionRows = await fetchPendingQuestionsWithRetry(client, directory, requestOptions, { maxAttempts: 1 });
+    } catch (error) {
+      if (isAbortLikeError(error)) {
+        throw error;
+      }
+      console.warn(`[trace][session] question.list transient-failure directory=${directory} session=${sessionId} reason=${String(error?.message || error)}`);
+    }
+    const snapshot = readLatestAssistantResponse(rows, questionRows, sessionId, sinceCreatedAt, seenMessageIds, seenQuestionIds);
+    const snapshotKey = buildAssistantSnapshotKey(snapshot);
+    if (snapshotKey !== activityState.lastSnapshotKey) {
+      activityState.lastSnapshotKey = snapshotKey;
+      activityState.lastObservedAt = Date.now();
+    }
+    latestSnapshot = snapshot;
+    if (snapshot.completed) {
       if (progressState) {
         const now = Date.now();
         progressState.lastProgressAt = now;
@@ -241,15 +476,27 @@ export async function waitForAssistantMessage(client, directory, sessionId, sinc
           progressState.firstProgressAt = now;
         }
       }
-      console.log(`[trace][session] waitForAssistantMessage hit directory=${directory} session=${sessionId} polls=${polls} elapsedMs=${Date.now() - startedAt} outputLen=${output.length}`);
-      return output;
+      console.log(
+        `[trace][session] waitForAssistantMessage hit directory=${directory} session=${sessionId}`
+        + ` polls=${polls} elapsedMs=${Date.now() - startedAt} outputLen=${String(snapshot.text || "").length}`
+        + ` messageCompleted=${snapshot.messageCompleted ? 1 : 0} messageTerminal=${snapshot.messageTerminal ? 1 : 0}`
+        + ` hasQuestion=${snapshot.hasQuestion ? 1 : 0} finish=${snapshot.messageFinish || ""}`
+      );
+      return String(snapshot.text || "");
     }
     await sleep(MESSAGE_POLL_INTERVAL_MS);
   }
   const sinceProgressMs = Number(progressState?.lastProgressAt || 0) > 0
     ? Date.now() - Number(progressState.lastProgressAt)
     : -1;
-  throw new Error(`OpenCode 消息轮询超时（>${MESSAGE_POLL_TIMEOUT_MS}ms）${sinceProgressMs >= 0 ? `，距最近进度 ${sinceProgressMs}ms` : ""}`);
+  const sinceObservedMs = Number(activityState?.lastObservedAt || 0) > 0
+    ? Date.now() - Number(activityState.lastObservedAt)
+    : -1;
+  throw new Error(
+    `OpenCode 消息轮询超时（>${MESSAGE_POLL_TIMEOUT_MS}ms）`
+    + `${sinceProgressMs >= 0 ? `，距最近进度 ${sinceProgressMs}ms` : ""}`
+    + `${sinceObservedMs >= 0 ? `，距最近状态变化 ${sinceObservedMs}ms` : ""}`
+  );
 }
 
 export function readLatestAssistantProgress(rows, sinceCreatedAt = 0, seenMessageIds = new Set()) {

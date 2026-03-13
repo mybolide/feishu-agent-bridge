@@ -19,14 +19,10 @@ export function createOpenCodeProgressCard({ status, elapsedSeconds = 0, detail 
     if (detail) {
         content += `\n\n${detail}`;
     }
+    void latestOutput;
     const elements = [
         { tag: "div", text: { tag: "lark_md", content } }
     ];
-    if (latestOutput) {
-        const snippet = latestOutput.length > 800 ? latestOutput.slice(-800) : latestOutput;
-        elements.push({ tag: "hr" });
-        elements.push({ tag: "div", text: { tag: "plain_text", content: `最近输出片段：\n${snippet}` } });
-    }
     const actions = [];
     if (status === "running") {
         actions.push({ tag: "button", type: "danger", text: { tag: "plain_text", content: "⏹ 中止对话" }, value: { action: "abort_task" } });
