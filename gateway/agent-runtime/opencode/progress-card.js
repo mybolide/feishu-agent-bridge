@@ -38,7 +38,7 @@ export function createOpenCodeProgressCard({ status, elapsedSeconds = 0, detail 
     }
     if (actions.length > 0) {
         elements.push({ tag: "hr" });
-        elements.push({ tag: "action", actions });
+        elements.push({ tag: "action", layout: "bisect", actions });
     }
     return {
         config: { wide_screen_mode: true },

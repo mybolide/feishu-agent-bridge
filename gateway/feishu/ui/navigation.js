@@ -27,8 +27,8 @@ import {
 } from "../../agent-runtime/index.js";
 
 const navRoot = projectRoot;
-const NAV_DIR_BUTTON_LIMIT = 12;
-const NAV_FILE_BUTTON_LIMIT = 9;
+const NAV_DIR_BUTTON_LIMIT = 999;
+const NAV_FILE_BUTTON_LIMIT = 999;
 const NAV_BUTTONS_PER_ROW = 3;
 const NAV_ENTRY_BUTTONS_PER_ROW = 0;
 const NAV_FLOW_ACTION_GROUP_LIMIT = 5;
@@ -97,22 +97,38 @@ function isListDirectoryCommand(text) {
   ]).has(compact);
 }
 
+function formatBeijingTime(date = new Date()) {
+  // 北京时间 UTC+8
+  const d = date instanceof Date ? date : new Date(date);
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  const hours = String(d.getHours()).padStart(2, '0');
+  const minutes = String(d.getMinutes()).padStart(2, '0');
+  const seconds = String(d.getSeconds()).padStart(2, '0');
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
 function listEntries(targetPath) {
+  const startTime = Date.now();
   const dirs = [];
   const files = [];
   const hiddenDirs = new Set([".oc_trash", ".git"]);
   const names = fs.readdirSync(targetPath, { encoding: "utf8" });
+  console.log(`[debug][listEntries] path=${targetPath} raw_count=${names.length} timestamp=${formatBeijingTime()}`);
   for (const rawName of names) {
     const name = String(rawName || "");
     if (hiddenDirs.has(name)) {
+      console.log(`[debug][listEntries] skip hidden: ${name}`);
       continue;
     }
     const fullPath = path.join(targetPath, name);
     let stat = null;
     try {
       stat = fs.statSync(fullPath);
-    } catch {
+    } catch (err) {
       // Entry may have been removed between readdir and stat.
+      console.log(`[debug][listEntries] stat failed: ${name} - ${err.message}`);
       continue;
     }
     if (stat.isDirectory()) {
@@ -123,6 +139,7 @@ function listEntries(targetPath) {
   }
   dirs.sort((a, b) => a.localeCompare(b, "zh-CN"));
   files.sort((a, b) => a.localeCompare(b, "zh-CN"));
+  console.log(`[debug][listEntries] result: dirs=${dirs.length} [${dirs.slice(0, 5).join(", ")}${dirs.length > 5 ? "..." : ""}] files=${files.length} [${files.slice(0, 5).join(", ")}${files.length > 5 ? "..." : ""}] elapsed=${Date.now() - startTime}ms`);
   return { dirs, files };
 }
 
@@ -349,7 +366,7 @@ export function createNavigationHandlers({
       `- 名称：\`${path.basename(filePath)}\``,
       `- 路径：\`${filePath}\``,
       `- 大小：\`${stat.size} B\``,
-      `- 修改时间：\`${new Date(stat.mtimeMs).toISOString()}\``
+      `- 修改时间：\`${formatBeijingTime(new Date(stat.mtimeMs))}\``
     ].join("\n");
     const controls = [
       { label: "发给我", type: "primary", value: { action: "nav_file_send", token: fileToken } },
@@ -488,7 +505,7 @@ export function createNavigationHandlers({
 
     const summary = [
       `当前目录：\`${resolved}\``,
-      `刷新时间：\`${new Date().toISOString()}\``,
+      `刷新时间：\`${formatBeijingTime()}\``,
       `当前工具：\`${activeTool}\``,
       `当前模型：\`${activeModel || "未设置"}\``,
       activeSession ? `当前会话：\`${activeSession}\`` : "",
