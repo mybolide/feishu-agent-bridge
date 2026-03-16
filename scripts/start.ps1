@@ -1,7 +1,8 @@
 param(
   [int]$Port = 7071,
   [switch]$SkipInstall,
-  [switch]$SkipOpenCodeServer
+  [switch]$SkipOpenCodeServer,
+  [switch]$DisableAutoRestart
 )
 
 $ErrorActionPreference = "Stop"
@@ -598,7 +599,11 @@ $nodeErrLog = Join-Path $logDir "node-gateway.err.log"
 if (Test-Path $nodeOutLog) { Remove-Item $nodeOutLog -Force -ErrorAction SilentlyContinue }
 if (Test-Path $nodeErrLog) { Remove-Item $nodeErrLog -Force -ErrorAction SilentlyContinue }
 
-Write-Host "[start] launching gateway sdk worker (default hot reload) ..."
+if ($DisableAutoRestart) {
+  Write-Host "[start] launching gateway sdk worker (auto restart: off) ..."
+} else {
+  Write-Host "[start] launching gateway sdk worker (auto restart: on) ..."
+}
 $nodeCmd = "node.exe"
 try {
   $resolvedNode = (Get-Command node.exe -ErrorAction Stop).Source
@@ -606,10 +611,11 @@ try {
 } catch {}
 
 $env:NODE_GATEWAY_PORT = "$Port"
-$gatewayProc = Start-Process -WindowStyle Hidden -FilePath $nodeCmd -ArgumentList @(
-  "--watch",
-  $gatewayEntry
-) -WorkingDirectory $root -RedirectStandardOutput $nodeOutLog -RedirectStandardError $nodeErrLog -PassThru
+$nodeArgs = @($gatewayEntry)
+if (-not $DisableAutoRestart) {
+  $nodeArgs = @("--watch", $gatewayEntry)
+}
+$gatewayProc = Start-Process -WindowStyle Hidden -FilePath $nodeCmd -ArgumentList $nodeArgs -WorkingDirectory $root -RedirectStandardOutput $nodeOutLog -RedirectStandardError $nodeErrLog -PassThru
 
 $openCodePid = 0
 try {

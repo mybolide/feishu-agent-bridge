@@ -801,8 +801,15 @@ export function createNavigationHandlers({
         return true;
       }
       try {
-        await sendFileFromFile(chatId, filePath);
-        await sendText(chatId, `✅ 文件已发送：\`${filePath}\``);
+        const sent = await sendFileFromFile(chatId, filePath);
+        if (sent?.fallbackUsed) {
+          await sendText(
+            chatId,
+            `✅ 文件已发送：\`${sent.uploadName}\`\n原文件：\`${filePath}\`\n说明：飞书拒绝直接上传该二进制文件，已自动打包为 ZIP 发送。`
+          );
+        } else {
+          await sendText(chatId, `✅ 文件已发送：\`${filePath}\``);
+        }
       } catch (error) {
         await sendText(chatId, `❌ 发送文件失败：${error instanceof Error ? error.message : String(error)}`);
       }

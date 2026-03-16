@@ -1,10 +1,14 @@
 import * as lark from "@larksuiteoapi/node-sdk";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { config } from "../../config/index.js";
 
 const TYPING_EMOJI = "Typing";
 const WS_CONFIG_REQUEST_TIMEOUT_MS = 15000;
+const FEISHU_IM_FILE_MAX_BYTES = 30 * 1024 * 1024;
+const FEISHU_PARSE_ERROR_TEXT = "error when parsing request";
 
 const domain = config.feishuDomain === "lark" ? lark.Domain.Lark : lark.Domain.Feishu;
 const domainBaseUrl = config.feishuDomain === "lark"
@@ -84,6 +88,128 @@ function resolveFeishuSendTarget(target) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms || 0)));
+}
+
+function stringifyFeishuResponseData(data) {
+  if (data === null || data === undefined) {
+    return "";
+  }
+  if (typeof data === "string") {
+    return data.trim();
+  }
+  try {
+    return JSON.stringify(data);
+  } catch {
+    return String(data);
+  }
+}
+
+export function describeFeishuApiError(error) {
+  const status = Number(error?.response?.status || 0);
+  const responseBody = stringifyFeishuResponseData(error?.response?.data);
+  const rawMessage = String(error?.message || error || "").trim();
+  const details = [];
+  if (status > 0) {
+    details.push(`status=${status}`);
+  }
+  if (responseBody) {
+    details.push(`body=${responseBody}`);
+  }
+  if (rawMessage) {
+    details.push(`message=${rawMessage}`);
+  }
+  return details.join(" ");
+}
+
+export function isFeishuRequestParseError(error) {
+  const status = Number(error?.response?.status || 0);
+  const responseBody = stringifyFeishuResponseData(error?.response?.data).toLowerCase();
+  return status === 400 && responseBody.includes(FEISHU_PARSE_ERROR_TEXT);
+}
+
+function escapePowerShellLiteral(value) {
+  return String(value || "").replace(/'/g, "''");
+}
+
+function runCommand(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+        return;
+      }
+      const detail = [stdout.trim(), stderr.trim()].filter(Boolean).join(" ").trim();
+      reject(new Error(detail || `${command} exited with code ${code}`));
+    });
+  });
+}
+
+async function createZipUploadFallback(filePath) {
+  if (process.platform !== "win32") {
+    throw new Error("zip fallback is only supported on Windows hosts");
+  }
+  const originalPath = path.resolve(filePath);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "feishu-upload-"));
+  const archivePath = path.join(tempDir, `${path.basename(originalPath)}.zip`);
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `Compress-Archive -LiteralPath '${escapePowerShellLiteral(originalPath)}' -DestinationPath '${escapePowerShellLiteral(archivePath)}' -CompressionLevel Optimal -Force`
+  ].join("; ");
+  await runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script]);
+  const stat = fs.statSync(archivePath);
+  if (stat.size > FEISHU_IM_FILE_MAX_BYTES) {
+    throw new Error(`zip fallback exceeds Feishu 30MB upload limit (${stat.size} bytes)`);
+  }
+  return {
+    archivePath,
+    uploadName: path.basename(archivePath),
+    cleanup() {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  };
+}
+
+async function uploadFeishuFile(filePath, uploadName = path.basename(filePath)) {
+  const file = fs.readFileSync(filePath);
+  const uploaded = await client.im.file.create({
+    data: {
+      file_type: "stream",
+      file_name: uploadName,
+      file
+    }
+  });
+  const fileKey = String(uploaded?.data?.file_key || uploaded?.file_key || "").trim();
+  if (!fileKey) {
+    throw new Error(`upload file failed: ${uploadName}`);
+  }
+  return {
+    fileKey,
+    uploadName
+  };
+}
+
+async function sendFeishuFileMessage(receiveId, receiveIdType, fileKey) {
+  await client.im.message.create({
+    params: { receive_id_type: receiveIdType },
+    data: {
+      receive_id: receiveId,
+      msg_type: "file",
+      content: JSON.stringify({ file_key: fileKey })
+    }
+  });
 }
 
 async function sdkSendMessage(chatId, msgType, content) {
@@ -220,29 +346,79 @@ export async function removeTypingReaction(state) {
   }
 }
 
-export async function sendFileFromFile(chatId, filePath) {
+export async function sendFileFromFile(chatId, filePath, options = {}) {
   const { receiveId, receiveIdType } = resolveFeishuSendTarget(chatId);
-  const file = fs.readFileSync(filePath);
-  const name = path.basename(filePath);
-  const uploaded = await client.im.file.create({
-    data: {
-      file_type: "stream",
-      file_name: name,
-      file
+  const uploadFile = typeof options?.uploadFile === "function" ? options.uploadFile : uploadFeishuFile;
+  const sendMessage = typeof options?.sendMessage === "function"
+    ? options.sendMessage
+    : async ({ receiveId: targetId, receiveIdType: targetType, fileKey }) => {
+      await sendFeishuFileMessage(targetId, targetType, fileKey);
+    };
+  const createZipFallback = typeof options?.createZipFallback === "function"
+    ? options.createZipFallback
+    : createZipUploadFallback;
+  const originalPath = path.resolve(filePath);
+  const originalName = path.basename(originalPath);
+  let cleanupFallback = null;
+  const deliverUpload = async (uploadPath, uploadName) => {
+    const uploaded = await uploadFile(uploadPath, uploadName);
+    const fileKey = String(uploaded?.fileKey || "").trim();
+    if (!fileKey) {
+      throw new Error(`upload file failed: ${uploadName}`);
     }
-  });
-  const fileKey = String(uploaded?.data?.file_key || uploaded?.file_key || "").trim();
-  if (!fileKey) {
-    throw new Error(`upload file failed: ${filePath}`);
+    return {
+      fileKey,
+      uploadName
+    };
+  };
+  let delivered = null;
+
+  try {
+    delivered = await deliverUpload(originalPath, originalName);
+  } catch (error) {
+    if (!isFeishuRequestParseError(error)) {
+      throw new Error(`upload file failed: ${originalName} (${describeFeishuApiError(error)})`);
+    }
+
+    console.warn(`[feishu] upload parse error for ${originalPath}, retrying with zip fallback`);
+    let fallback = null;
+    try {
+      fallback = await createZipFallback(originalPath);
+      cleanupFallback = typeof fallback?.cleanup === "function" ? fallback.cleanup : null;
+      const fallbackPath = path.resolve(fallback?.archivePath || "");
+      const fallbackName = String(fallback?.uploadName || path.basename(fallbackPath)).trim();
+      if (!fallbackPath || !fallbackName) {
+        throw new Error("zip fallback did not return a valid archive path");
+      }
+      delivered = await deliverUpload(fallbackPath, fallbackName);
+      delivered.fallbackUsed = true;
+    } catch (fallbackError) {
+      throw new Error(
+        `upload file failed: ${originalName} (${describeFeishuApiError(error)}); zip fallback failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`
+      );
+    } finally {
+      if (cleanupFallback) {
+        try {
+          cleanupFallback();
+        } catch {
+          // ignore temp cleanup failures
+        }
+      }
+    }
   }
-  await client.im.message.create({
-    params: { receive_id_type: receiveIdType },
-    data: {
-      receive_id: receiveId,
-      msg_type: "file",
-      content: JSON.stringify({ file_key: fileKey })
-    }
-  });
+
+  try {
+    await sendMessage({ receiveId, receiveIdType, fileKey: delivered.fileKey });
+  } catch (error) {
+    throw new Error(`send file message failed: ${delivered.uploadName} (${describeFeishuApiError(error)})`);
+  }
+
+  return {
+    fileKey: delivered.fileKey,
+    uploadName: delivered.uploadName,
+    originalPath,
+    fallbackUsed: delivered.fallbackUsed === true
+  };
 }
 
 function resolvePreflightError(error) {
