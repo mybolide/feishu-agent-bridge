@@ -146,7 +146,8 @@ export async function sendClaudeMessage(directory, sessionId, text, model, optio
   const queryOptions = {
     model: effectiveModel,
     cwd: normalizedDir,
-    permissionMode: "acceptEdits",  // Auto-accept file edits
+    permissionMode: "bypassPermissions",  // 跳过所有权限检查
+    allowDangerouslySkipPermissions: true,  // 安全确认
     abortController,
     env: {
       ...getBailianEnv(),
