@@ -1,8 +1,27 @@
 import { query, listSessions, forkSession, getSessionInfo, getSessionMessages, AbortError } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "../../config/index.js";
+import fs from "node:fs";
+import path from "node:path";
 
 const DEFAULT_MODEL = "qwen3.5-plus";
 const REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
+const LOG_FILE = path.join(process.cwd(), "logs", "claude-sdk.log");
+
+// 确保日志目录存在
+function ensureLogDir() {
+  const dir = path.dirname(LOG_FILE);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function log(msg) {
+  ensureLogDir();
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  fs.appendFileSync(LOG_FILE, line);
+  // 同时输出到 console
+  console.log(line.trim());
+}
 
 function getBailianEnv() {
   const env = {};
@@ -162,8 +181,8 @@ export async function sendClaudeMessage(directory, sessionId, text, model, optio
         break;
       }
 
-      // Extract session ID from any message
-      if (message.session_id && !resultSessionId) {
+      // Extract session ID from any message that has it
+      if (message.session_id) {
         resultSessionId = message.session_id;
       }
 
@@ -223,6 +242,9 @@ export async function sendClaudeMessage(directory, sessionId, text, model, optio
       };
     }
   }
+
+  // 记录最终返回结果
+  log(`[claude] sendMessage result: sessionId=${resultSessionId || 'MISSING'} output.length=${output.length} error=${error ? error.name : 'none'}`);
 
   return {
     output,
