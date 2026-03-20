@@ -628,7 +628,7 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
     const runtimeInput = buildRuntimeInput(command, binding.repoPath);
     while (true) {
       try {
-        output = await runtimeProvider.run.sendMessage(binding.repoPath, activeSessionId, runtimeInput, effectiveModel, {
+        const result = await runtimeProvider.run.sendMessage(binding.repoPath, activeSessionId, runtimeInput, effectiveModel, {
           signal: abortController.signal,
           onProgress: async (progress) => {
             const text = String(progress?.text || "");
@@ -647,6 +647,22 @@ async function executeRunUnsafe(threadId, command, model, toolId = "") {
             }
           }
         });
+        
+        // 处理返回值：支持字符串或对象
+        if (typeof result === "object" && result !== null) {
+          output = String(result.output || "");
+          // 如果返回了新的 sessionId，更新会话
+          const newSessionId = String(result.sessionId || "").trim();
+          if (newSessionId && newSessionId !== activeSessionId) {
+            activeSessionId = newSessionId;
+            setThreadSession(threadId, activeSessionId);
+            patchRunRef(runId, { sessionId: activeSessionId });
+            patchQueuedRun(runId, { sessionId: activeSessionId });
+            console.log(`[trace][session] session-updated thread=${threadId} run=${runId} newSession=${activeSessionId}`);
+          }
+        } else {
+          output = String(result || "");
+        }
         break;
       } catch (error) {
         const retryInCurrentSession = shouldRetryInCurrentSession({

@@ -29,17 +29,23 @@ export function createClaudeRuntimeProvider() {
     run: {
       sendMessage: async (directory, sessionId, text, model, options = {}) => {
         const result = await sendClaudeMessage(directory, sessionId, text, model, options);
+        
+        // 返回对象，包含 output 和 sessionId（用于更新会话）
+        const outputText = result.error && result.output
+          ? `${result.output}\n\n⚠️ ${result.error.name}: ${result.error.message}`
+          : result.output || "";
+        
         if (result.error && !result.output) {
-          // If there's an error and no output, throw it
           const err = new Error(result.error.message || "Unknown error");
           err.name = result.error.name || "UnknownError";
           throw err;
         }
-        // If there's an error but also output, append the error to the output
-        if (result.error && result.output) {
-          return `${result.output}\n\n⚠️ ${result.error.name}: ${result.error.message}`;
-        }
-        return result.output;
+        
+        return {
+          output: outputText,
+          sessionId: result.sessionId,  // 返回新的 sessionId
+          error: result.error
+        };
       },
       isAbortLikeError
     }
