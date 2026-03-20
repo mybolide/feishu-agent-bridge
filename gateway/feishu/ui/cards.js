@@ -62,12 +62,17 @@ export function shouldRenderResultAsMarkdownCard(taskOutput) {
 }
 
 export function buildTaskResultNavigatorCard(targetPath, taskOutput, taskFeedback = {}) {
-  const _ignored = { targetPath, taskFeedback };
-  void _ignored;
   const preview = String(taskOutput || "").trim() || "(无输出)";
-  const cardContent = preview.length > RESULT_CARD_MAX_CHARS
+  let cardContent = preview.length > RESULT_CARD_MAX_CHARS
     ? `${preview.slice(0, RESULT_CARD_MAX_CHARS)}\n\n...(已截断)`
     : preview;
+  
+  // 添加会话信息
+  const sessionId = String(taskFeedback?.session_id || "").trim();
+  if (sessionId) {
+    cardContent += `\n\n---\n**会话ID：** \`${sessionId}\``;
+  }
+  
   return buildMarkdownCard(normalizeMarkdownForFeishu(cardContent));
 }
 
