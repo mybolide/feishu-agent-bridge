@@ -13,8 +13,9 @@
 - 流式卡片更新
 - 支持中止 / 中止并新建会话
 - 运行时提供方：
-  - `opencode`（已对接）
-  - `iflow-cli`（已对接）
+  - `opencode`（已对接）- OpenCode SDK
+  - `iflow-cli`（已对接）- iFlow CLI
+  - `claude`（已对接）- Claude Code SDK，支持百炼 Coding Plan
   - `gemini-cli`（预留扩展点）
   - `codex-cli`（预留扩展点）
 
@@ -22,6 +23,7 @@
 
 - `opencode`：已完成接入并纳入统一路由。
 - `iflow-cli`：已完成接入并纳入统一路由。
+- `claude`：已完成接入，支持百炼 Coding Plan API。模型：qwen3.5-plus、glm-5、kimi-k2.5、MiniMax-M2.5。
 - 统一 Provider 接口已就绪，后续可继续扩展其他运行时。
 
 ## 环境要求
@@ -32,6 +34,7 @@
 - 可选：
   - OpenCode CLI/Server
   - iFlow CLI 及鉴权配置
+  - Claude Code CLI + 百炼 Coding Plan API Key
 
 ## 快速开始
 
@@ -52,10 +55,25 @@ Copy-Item .env.example .env
 - `FEISHU_APP_ID`
 - `FEISHU_APP_SECRET`
 
-4. 启动网关（默认热更新）：
+4. （可选）配置 Claude Code SDK 百炼 Coding Plan：
+
+- `CLAUDE_AUTH_TOKEN` - 百炼 Coding Plan API Key
+- `CLAUDE_BASE_URL` - API 端点（默认：`https://coding.dashscope.aliyuncs.com/apps/anthropic`）
+
+5. 启动网关（默认热更新）：
 
 ```powershell
 .\scripts\start.ps1
+```
+
+## 使用方式
+
+在飞书聊天中切换运行时：
+
+```
+/oc tool opencode    # 使用 OpenCode SDK
+/oc tool iflow-cli   # 使用 iFlow CLI
+/oc tool claude      # 使用 Claude Code SDK（百炼）
 ```
 
 ## 常用命令

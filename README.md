@@ -13,8 +13,9 @@ It receives Feishu long-connection events and routes requests to configured agen
 - Streaming response card updates
 - Abort / abort-and-new-session operations
 - Runtime providers:
-  - `opencode` (integrated)
-  - `iflow-cli` (integrated)
+  - `opencode` (integrated) - OpenCode SDK
+  - `iflow-cli` (integrated) - iFlow CLI
+  - `claude` (integrated) - Claude Code SDK with Bailian Coding Plan
   - `gemini-cli` (reserved extension point)
   - `codex-cli` (reserved extension point)
 
@@ -22,6 +23,7 @@ It receives Feishu long-connection events and routes requests to configured agen
 
 - `opencode`: integrated and available in runtime routing.
 - `iflow-cli`: integrated and available in runtime routing.
+- `claude`: integrated with Bailian Coding Plan API support. Models: qwen3.5-plus, glm-5, kimi-k2.5, MiniMax-M2.5.
 - Unified provider interface is in place for adding more runtimes.
 
 ## Requirements
@@ -32,6 +34,7 @@ It receives Feishu long-connection events and routes requests to configured agen
 - Optional:
   - OpenCode CLI/server
   - iFlow CLI + auth config
+  - Claude Code CLI + Bailian Coding Plan API key
 
 ## Quick Start
 
@@ -52,10 +55,25 @@ Copy-Item .env.example .env
 - `FEISHU_APP_ID`
 - `FEISHU_APP_SECRET`
 
-4. Start gateway (hot reload enabled by default):
+4. (Optional) Configure Claude Code SDK for Bailian Coding Plan:
+
+- `CLAUDE_AUTH_TOKEN` - Your Bailian Coding Plan API key
+- `CLAUDE_BASE_URL` - API endpoint (default: `https://coding.dashscope.aliyuncs.com/apps/anthropic`)
+
+5. Start gateway (hot reload enabled by default):
 
 ```powershell
 .\scripts\start.ps1
+```
+
+## Usage
+
+Switch runtime in Feishu chat:
+
+```
+/oc tool opencode    # Use OpenCode SDK
+/oc tool iflow-cli   # Use iFlow CLI
+/oc tool claude      # Use Claude Code SDK (Bailian)
 ```
 
 ## Useful Commands
