@@ -325,6 +325,55 @@ test("readLatestAssistantResponse returns empty text when terminal assistant fin
   assert.equal(snapshot.text, "");
 });
 
+test("readLatestAssistantResponse returns error message when error field exists", () => {
+  const snapshot = readLatestAssistantResponse([
+    {
+      info: {
+        id: "msg-error",
+        role: "assistant",
+        finish: "error",
+        time: { created: 600, completed: 620 },
+        error: {
+          name: "MessageOutputLengthError",
+          data: { message: "输出长度超过限制" }
+        }
+      },
+      parts: [
+        { type: "step-start" },
+        { type: "step-finish" }
+      ]
+    }
+  ], [], "session-1", 0, new Set(), new Set());
+
+  assert.equal(snapshot.completed, true);
+  assert.equal(snapshot.messageTerminal, true);
+  assert.equal(snapshot.messageFinish, "error");
+  assert.match(snapshot.text, /Token 超出限制/);
+  assert.match(snapshot.text, /输出长度超过限制/);
+  assert.ok(snapshot.messageError);
+  assert.equal(snapshot.messageError.name, "MessageOutputLengthError");
+});
+
+test("readLatestAssistantResponse completes immediately when error exists even without completedAt", () => {
+  const snapshot = readLatestAssistantResponse([
+    {
+      info: {
+        id: "msg-error",
+        role: "assistant",
+        error: {
+          name: "ApiError",
+          data: { message: "Rate limit exceeded" }
+        }
+      },
+      parts: []
+    }
+  ], [], "session-1", 0, new Set(), new Set());
+
+  assert.equal(snapshot.completed, true);
+  assert.match(snapshot.text, /API 错误/);
+  assert.match(snapshot.text, /Rate limit exceeded/);
+});
+
 test("extractTextFromParts appends raw tool text after assistant text", () => {
   const text = extractTextFromParts([
     { type: "text", text: "没有卡，正在继续创建模块。加快速度：" },

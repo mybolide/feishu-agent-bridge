@@ -1,5 +1,6 @@
 import { createOpenCodeRuntimeProvider } from "./providers/opencode.js";
 import { createIFlowRuntimeProvider } from "./providers/iflow-cli.js";
+import { createClaudeRuntimeProvider } from "./providers/claude.js";
 
 function parseBoolean(raw, fallback) {
   const value = String(raw ?? "").trim().toLowerCase();
@@ -16,6 +17,7 @@ function parseBoolean(raw, fallback) {
 }
 
 const IFLOW_RUNTIME_ENABLED = parseBoolean(process.env.IFLOW_RUNTIME_ENABLED, true);
+const CLAUDE_RUNTIME_ENABLED = parseBoolean(process.env.CLAUDE_RUNTIME_ENABLED, true);
 
 const RUNTIME_PROVIDER_REGISTRY = [
   {
@@ -31,6 +33,13 @@ const RUNTIME_PROVIDER_REGISTRY = [
     available: IFLOW_RUNTIME_ENABLED,
     reason: IFLOW_RUNTIME_ENABLED ? "" : "IFLOW_RUNTIME_ENABLED=false",
     create: IFLOW_RUNTIME_ENABLED ? createIFlowRuntimeProvider : null
+  },
+  {
+    id: "claude",
+    label: "Claude Code SDK",
+    available: CLAUDE_RUNTIME_ENABLED,
+    reason: CLAUDE_RUNTIME_ENABLED ? "" : "CLAUDE_RUNTIME_ENABLED=false",
+    create: CLAUDE_RUNTIME_ENABLED ? createClaudeRuntimeProvider : null
   },
   {
     id: "gemini-cli",

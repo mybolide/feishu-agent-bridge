@@ -20,3 +20,13 @@ test("buildOpencodeCandidateBaseUrls should keep remote urls unchanged", () => {
   const rows = buildOpencodeCandidateBaseUrls("https://api.example.com:2443", 5);
   assert.deepEqual(rows, ["https://api.example.com:2443"]);
 });
+
+test("buildOpencodeCandidateBaseUrls should append discovered loopback process ports", () => {
+  const rows = buildOpencodeCandidateBaseUrls("http://127.0.0.1:24096", 0, [62570, 55702, 24096, 0, -1, "abc"]);
+  assert.deepEqual(rows, [
+    "http://127.0.0.1:24096",
+    "http://127.0.0.1:14096",
+    "http://127.0.0.1:62570",
+    "http://127.0.0.1:55702"
+  ]);
+});

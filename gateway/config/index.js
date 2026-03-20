@@ -74,5 +74,8 @@ export const config = {
   feishuHttpDisableProxy: parseBoolean(process.env.FEISHU_HTTP_DISABLE_PROXY, true),
   feishuWsStartupCheckTimeoutMs: parsePositiveInt(process.env.FEISHU_WS_STARTUP_CHECK_TIMEOUT_MS, 10000),
   feishuEncryptKey: String(process.env.FEISHU_ENCRYPT_KEY || "").trim(),
-  dbFile: resolveProjectPath(process.env.DB_PATH, "data.db")
+  dbFile: resolveProjectPath(process.env.DB_PATH, "data.db"),
+  // Claude Code SDK 配置
+  claudeAuthToken: String(process.env.CLAUDE_AUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN || "").trim(),
+  claudeBaseUrl: String(process.env.CLAUDE_BASE_URL || process.env.ANTHROPIC_BASE_URL || "https://coding.dashscope.aliyuncs.com/apps/anthropic").trim()
 };

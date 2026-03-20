@@ -62,7 +62,25 @@ function extractMessageFinish(item) {
   return String(info.finish || item?.finish || "").trim().toLowerCase();
 }
 
+function extractMessageError(item) {
+  const info = extractMessageInfo(item);
+  const error = info?.error;
+  if (!error || typeof error !== "object") {
+    return null;
+  }
+  const name = String(error.name || "").trim();
+  const message = String(error?.data?.message || error?.message || "").trim();
+  if (!name && !message) {
+    return null;
+  }
+  return { name, message };
+}
+
 function isTerminalAssistantMessage(candidate) {
+  // finish === "error" 或有 error 字段时直接认为 terminal
+  if (candidate?.finish === "error" || candidate?.error) {
+    return true;
+  }
   if (!candidate?.completed) {
     return false;
   }
@@ -74,6 +92,10 @@ function isDisplayCompleteAssistantMessage(candidate) {
     return false;
   }
   if (candidate.terminal) {
+    return true;
+  }
+  // finish === "error" 或有 error 字段时认为完成
+  if (candidate.finish === "error" || candidate.error) {
     return true;
   }
   return candidate.finish === "stop" && Boolean(String(candidate.text || "").trim());
@@ -137,22 +159,25 @@ function latestAssistantMessage(rows, sinceCreatedAt = 0, seenMessageIds = new S
       continue;
     }
     const createdAt = extractMessageCreatedAt(row);
-    if (createdAt < sinceCreatedAt) {
+if (createdAt < sinceCreatedAt) {
       continue;
     }
     const text = extractTextFromParts(row.parts);
     const completedAt = extractMessageCompletedAt(row);
     const finish = extractMessageFinish(row);
+    const error = extractMessageError(row);
     const candidate = {
       id: messageId,
       text,
+      error,
       createdAt,
       completedAt,
-      completed: completedAt > 0,
+      completed: completedAt > 0 || finish === "error",
       finish,
       terminal: isTerminalAssistantMessage({
-        completed: completedAt > 0,
-        finish
+        completed: completedAt > 0 || finish === "error",
+        finish,
+        error
       })
     };
     if (candidate.terminal || candidate.text) {
@@ -265,9 +290,39 @@ export function formatQuestionRequestText(request) {
   return lines.join("\n").trim();
 }
 
-function combineAssistantSnapshot(text, questionText) {
-  const chunks = [String(text || "").trim(), String(questionText || "").trim()].filter(Boolean);
-  return chunks.join("\n\n").trim();
+function formatErrorMessage(error) {
+  if (!error || typeof error !== "object") {
+    return "";
+  }
+  const name = String(error.name || "").trim();
+  const message = String(error.message || "").trim();
+  if (!name && !message) {
+    return "";
+  }
+  // 友好化错误名称
+  let errorLabel = "错误";
+  if (name === "MessageOutputLengthError") {
+    errorLabel = "Token 超出限制";
+  } else if (name === "ProviderAuthError") {
+    errorLabel = "认证错误";
+  } else if (name === "ApiError") {
+    errorLabel = "API 错误";
+  } else if (name === "MessageAbortedError") {
+    errorLabel = "任务已中止";
+  } else if (name) {
+    errorLabel = name;
+  }
+  return message ? `❌ ${errorLabel}: ${message}` : `❌ ${errorLabel}`;
+}
+
+function combineAssistantSnapshot(text, questionText, error) {
+  const chunks = [String(text || "").trim()];
+  const errorText = formatErrorMessage(error);
+  if (errorText) {
+    chunks.push(errorText);
+  }
+  chunks.push(String(questionText || "").trim());
+  return chunks.filter(Boolean).join("\n\n").trim();
 }
 
 export function readLatestAssistantResponse(rows, questionRows, sessionId = "", sinceCreatedAt = 0, seenMessageIds = new Set(), seenQuestionIds = new Set()) {
@@ -276,6 +331,7 @@ export function readLatestAssistantResponse(rows, questionRows, sessionId = "", 
   const latestQuestion = latestPendingQuestion(questionRows, sessionId, seenQuestionIds);
   const latestText = resolveAssistantSnapshotText(latestMessage, latestVisibleText);
   const questionText = latestQuestion ? formatQuestionRequestText(latestQuestion) : "";
+  const messageError = latestMessage?.error || null;
   const messageDisplayComplete = isDisplayCompleteAssistantMessage({
     ...latestMessage,
     text: latestText
@@ -283,12 +339,13 @@ export function readLatestAssistantResponse(rows, questionRows, sessionId = "", 
   return {
     messageId: String(latestMessage?.id || ""),
     requestId: String(latestQuestion?.id || ""),
-    text: combineAssistantSnapshot(latestText, questionText),
-    completed: Boolean(questionText || messageDisplayComplete),
+    text: combineAssistantSnapshot(latestText, questionText, messageError),
+    completed: Boolean(questionText || messageDisplayComplete || messageError),
     hasQuestion: Boolean(questionText),
     messageCompleted: Boolean(latestMessage?.completed),
     messageTerminal: Boolean(messageDisplayComplete),
-    messageFinish: String(latestMessage?.finish || "")
+    messageFinish: String(latestMessage?.finish || ""),
+    messageError
   };
 }
 

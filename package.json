@@ -12,6 +12,7 @@
     "test:iflow": "node --test tests/iflow-receive-smoke.test.js"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.80",
     "@iflow-ai/iflow-cli-sdk": "^0.2.1-beta.5",
     "@larksuiteoapi/node-sdk": "^1.59.0",
     "@opencode-ai/sdk": "^1.2.22"
