@@ -16,7 +16,7 @@
   - `opencode`（已对接）- OpenCode SDK
   - `iflow-cli`（已对接）- iFlow CLI
   - `claude`（已对接）- Claude Code SDK，支持百炼 Coding Plan
-  - `gemini-cli`（预留扩展点）
+  - `gemini-cli`（已对接）- Gemini CLI
   - `codex-cli`（预留扩展点）
 
 ## 对接状态
@@ -24,6 +24,7 @@
 - `opencode`：已完成接入并纳入统一路由。
 - `iflow-cli`：已完成接入并纳入统一路由。
 - `claude`：已完成接入，支持百炼 Coding Plan API。模型：qwen3.5-plus、glm-5、kimi-k2.5、MiniMax-M2.5。
+- `gemini-cli`：已完成接入，支持 Google OAuth 或 API Key。模型：gemini-2.5-pro、gemini-2.5-flash、gemini-2.0-flash。
 - 统一 Provider 接口已就绪，后续可继续扩展其他运行时。
 
 ## 环境要求
@@ -35,6 +36,7 @@
   - OpenCode CLI/Server
   - iFlow CLI 及鉴权配置
   - Claude Code CLI + 百炼 Coding Plan API Key
+  - Gemini CLI + Google OAuth 或 API Key
 
 ## 快速开始
 
@@ -74,6 +76,7 @@ Copy-Item .env.example .env
 /oc tool opencode    # 使用 OpenCode SDK
 /oc tool iflow-cli   # 使用 iFlow CLI
 /oc tool claude      # 使用 Claude Code SDK（百炼）
+/oc tool gemini-cli  # 使用 Gemini CLI
 ```
 
 ## 常用命令

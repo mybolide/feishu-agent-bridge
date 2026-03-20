@@ -16,7 +16,7 @@ It receives Feishu long-connection events and routes requests to configured agen
   - `opencode` (integrated) - OpenCode SDK
   - `iflow-cli` (integrated) - iFlow CLI
   - `claude` (integrated) - Claude Code SDK with Bailian Coding Plan
-  - `gemini-cli` (reserved extension point)
+  - `gemini-cli` (integrated) - Gemini CLI
   - `codex-cli` (reserved extension point)
 
 ## Integration Status
@@ -24,6 +24,7 @@ It receives Feishu long-connection events and routes requests to configured agen
 - `opencode`: integrated and available in runtime routing.
 - `iflow-cli`: integrated and available in runtime routing.
 - `claude`: integrated with Bailian Coding Plan API support. Models: qwen3.5-plus, glm-5, kimi-k2.5, MiniMax-M2.5.
+- `gemini-cli`: integrated with Google OAuth / API Key. Models: gemini-2.5-pro, gemini-2.5-flash, gemini-2.0-flash.
 - Unified provider interface is in place for adding more runtimes.
 
 ## Requirements
@@ -35,6 +36,7 @@ It receives Feishu long-connection events and routes requests to configured agen
   - OpenCode CLI/server
   - iFlow CLI + auth config
   - Claude Code CLI + Bailian Coding Plan API key
+  - Gemini CLI + Google OAuth or API Key
 
 ## Quick Start
 
@@ -74,6 +76,7 @@ Switch runtime in Feishu chat:
 /oc tool opencode    # Use OpenCode SDK
 /oc tool iflow-cli   # Use iFlow CLI
 /oc tool claude      # Use Claude Code SDK (Bailian)
+/oc tool gemini-cli  # Use Gemini CLI
 ```
 
 ## Useful Commands

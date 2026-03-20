@@ -1,6 +1,7 @@
 import { createOpenCodeRuntimeProvider } from "./providers/opencode.js";
 import { createIFlowRuntimeProvider } from "./providers/iflow-cli.js";
 import { createClaudeRuntimeProvider } from "./providers/claude.js";
+import { createGeminiRuntimeProvider } from "./providers/gemini.js";
 
 function parseBoolean(raw, fallback) {
   const value = String(raw ?? "").trim().toLowerCase();
@@ -18,6 +19,7 @@ function parseBoolean(raw, fallback) {
 
 const IFLOW_RUNTIME_ENABLED = parseBoolean(process.env.IFLOW_RUNTIME_ENABLED, true);
 const CLAUDE_RUNTIME_ENABLED = parseBoolean(process.env.CLAUDE_RUNTIME_ENABLED, true);
+const GEMINI_RUNTIME_ENABLED = parseBoolean(process.env.GEMINI_RUNTIME_ENABLED, true);
 
 const RUNTIME_PROVIDER_REGISTRY = [
   {
@@ -44,9 +46,9 @@ const RUNTIME_PROVIDER_REGISTRY = [
   {
     id: "gemini-cli",
     label: "Gemini CLI",
-    available: false,
-    reason: "暂未接入，请先实现 provider",
-    create: null
+    available: GEMINI_RUNTIME_ENABLED,
+    reason: GEMINI_RUNTIME_ENABLED ? "" : "GEMINI_RUNTIME_ENABLED=false",
+    create: GEMINI_RUNTIME_ENABLED ? createGeminiRuntimeProvider : null
   },
   {
     id: "codex-cli",
