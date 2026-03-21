@@ -30,7 +30,6 @@
 ## 环境要求
 
 - Node.js `22+`（项目使用了 `node:sqlite`）
-- PowerShell（用于 `scripts/` 下脚本）
 - 飞书自建应用凭证
 - 可选：
   - OpenCode CLI/Server
@@ -42,14 +41,14 @@
 
 1. 安装依赖：
 
-```powershell
+```bash
 npm install
 ```
 
 2. 准备环境变量：
 
-```powershell
-Copy-Item .env.example .env
+```bash
+cp .env.example .env
 ```
 
 3. 在 `.env` 中填写必填项：
@@ -62,10 +61,35 @@ Copy-Item .env.example .env
 - `CLAUDE_AUTH_TOKEN` - 百炼 Coding Plan API Key
 - `CLAUDE_BASE_URL` - API 端点（默认：`https://coding.dashscope.aliyuncs.com/apps/anthropic`）
 
-5. 启动网关（默认热更新）：
+5. 启动网关：
 
+**Windows:**
 ```powershell
+.\start.bat
+# 或
 .\scripts\start.ps1
+```
+
+**Mac/Linux:**
+```bash
+chmod +x start.sh
+./start.sh
+```
+
+### 启动脚本参数
+
+```bash
+# 跳过 npm install，加快启动速度
+./start.sh --skip-install   # Mac/Linux
+.\start.bat                 # 在 start.bat 中设置 SKIP_INSTALL=1
+
+# 禁用文件变更自动重启
+./start.sh --no-restart     # Mac/Linux
+.\start.bat                 # 在 start.bat 中设置 AUTO_RESTART=0
+
+# 指定端口
+./start.sh --port 8080      # Mac/Linux
+.\start.bat                 # 在 start.bat 中编辑 PORT
 ```
 
 ## 使用方式
@@ -81,9 +105,19 @@ Copy-Item .env.example .env
 
 ## 常用命令
 
+**Windows:**
 ```powershell
 # 语法检查（CI/本地校验）
 .\scripts\lint.ps1 -SkipInstall
+
+# 单元测试
+npm test
+```
+
+**Mac/Linux:**
+```bash
+# 语法检查
+npm run lint
 
 # 单元测试
 npm test

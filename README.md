@@ -30,7 +30,6 @@ It receives Feishu long-connection events and routes requests to configured agen
 ## Requirements
 
 - Node.js `22+` (project uses `node:sqlite`)
-- PowerShell (for scripts under `scripts/`)
 - Feishu self-built app credentials
 - Optional:
   - OpenCode CLI/server
@@ -42,14 +41,14 @@ It receives Feishu long-connection events and routes requests to configured agen
 
 1. Install dependencies:
 
-```powershell
+```bash
 npm install
 ```
 
 2. Prepare env:
 
-```powershell
-Copy-Item .env.example .env
+```bash
+cp .env.example .env
 ```
 
 3. Fill required values in `.env`:
@@ -62,10 +61,35 @@ Copy-Item .env.example .env
 - `CLAUDE_AUTH_TOKEN` - Your Bailian Coding Plan API key
 - `CLAUDE_BASE_URL` - API endpoint (default: `https://coding.dashscope.aliyuncs.com/apps/anthropic`)
 
-5. Start gateway (hot reload enabled by default):
+5. Start gateway:
 
+**Windows:**
 ```powershell
+.\start.bat
+# or
 .\scripts\start.ps1
+```
+
+**Mac/Linux:**
+```bash
+chmod +x start.sh
+./start.sh
+```
+
+### Start Script Options
+
+```bash
+# Skip npm install for faster startup
+./start.sh --skip-install   # Mac/Linux
+.\start.bat                 # Set SKIP_INSTALL=1 in start.bat
+
+# Disable auto restart on file changes
+./start.sh --no-restart     # Mac/Linux
+.\start.bat                 # Set AUTO_RESTART=0 in start.bat
+
+# Specify port
+./start.sh --port 8080      # Mac/Linux
+.\start.bat                 # Edit PORT in start.bat
 ```
 
 ## Usage
@@ -81,9 +105,19 @@ Switch runtime in Feishu chat:
 
 ## Useful Commands
 
+**Windows:**
 ```powershell
 # syntax checks used by CI/local validation
 .\scripts\lint.ps1 -SkipInstall
+
+# unit tests
+npm test
+```
+
+**Mac/Linux:**
+```bash
+# syntax checks
+npm run lint
 
 # unit tests
 npm test
