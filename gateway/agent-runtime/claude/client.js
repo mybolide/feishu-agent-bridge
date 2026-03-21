@@ -150,8 +150,9 @@ export async function sendClaudeMessage(directory, sessionId, text, model, optio
     allowDangerouslySkipPermissions: true,  // 安全确认
     abortController,
     env: {
+      ...process.env,  // 继承系统环境变量（包含 PATH）
       ...getBailianEnv(),
-      // 保留其他必要的环境变量
+      // 禁用非必要流量
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
       DISABLE_TELEMETRY: "1"
     }
