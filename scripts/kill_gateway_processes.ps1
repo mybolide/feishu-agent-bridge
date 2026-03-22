@@ -250,24 +250,21 @@ $projectNorm = Normalize-Text $projectRoot
 $fallbackRoots = @()
 foreach ($entry in $processMap.Values) {
   $cmdNorm = Normalize-Text $entry.CommandLine
+  $nameNorm = Normalize-Text $entry.Name
   if (-not $cmdNorm) {
     continue
   }
-  $containsRoot = $cmdNorm.Contains($projectNorm)
-  $isRelativeGatewayCmd = Test-RelativeGatewayCommand -CommandLine $entry.CommandLine -ProcessName $entry.Name
-  if (-not $containsRoot -and -not $isRelativeGatewayCmd) {
-    continue
+  
+  # 简化匹配：只要命令行包含 gateway/main.js 且是 node 进程就杀死
+  $isNodeProcess = $nameNorm -eq "node.exe" -or $nameNorm -eq "cmd.exe"
+  $isGatewayProcess = $cmdNorm.Contains("gateway/main.js")
+  $isOpenCodeServe = $cmdNorm.Contains("opencode") -and $cmdNorm.Contains(" serve")
+  $isGatewayLog = $cmdNorm.Contains("node-gateway.out.log") -or $cmdNorm.Contains("node-gateway.err.log")
+  
+  if ($isNodeProcess -and ($isGatewayProcess -or $isGatewayLog)) {
+    $fallbackRoots += [int]$entry.Pid
   }
-  $isGatewayLike = $cmdNorm.Contains("gateway/main.js") `
-    -or $cmdNorm.Contains("node-gateway.out.log") `
-    -or $cmdNorm.Contains("node-gateway.err.log")
-  $isOpenCodeServeLike = $cmdNorm.Contains("opencode-serve.out.log") `
-    -or $cmdNorm.Contains("opencode-serve.err.log")
-  $isProjectNpmDev = $cmdNorm.Contains("npm-cli.js") `
-    -and $cmdNorm.Contains("--prefix") `
-    -and $cmdNorm.Contains(" run dev")
-
-  if ($isGatewayLike -or $isOpenCodeServeLike -or $isProjectNpmDev) {
+  if ($isOpenCodeServe) {
     $fallbackRoots += [int]$entry.Pid
   }
 }
