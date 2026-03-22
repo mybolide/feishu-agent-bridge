@@ -153,7 +153,11 @@ export async function createSession(directory, title) {
   const client = createSdkClient(normalizedDir);
   const created = await withTimeout(client.session.create({
     directory: normalizedDir,
-    title
+    title,
+    // 允许所有权限，跳过确认
+    permission: [
+      { permission: "*", pattern: "*", action: "allow" }
+    ]
   }), REQUEST_TIMEOUT_MS, `OpenCode session.create directory=${normalizedDir}`);
   const id = String(created?.id || "").trim();
   if (!id) {
