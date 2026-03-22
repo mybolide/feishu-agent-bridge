@@ -25,6 +25,7 @@ import {
   listRuntimeProviders,
   resolveRuntimeProvider
 } from "../../agent-runtime/index.js";
+import { resolveOpencodeBaseUrl } from "../../agent-runtime/opencode/server-discovery.js";
 
 const navRoot = projectRoot;
 const NAV_DIR_BUTTON_LIMIT = 999;
@@ -639,6 +640,21 @@ export function createNavigationHandlers({
         await sendText(chatId, `❌ 工具暂不可用：${toolMeta.label}（${toolMeta.reason || "未配置"}）`);
         return true;
       }
+
+      // 如果切换到 opencode，确保服务器可用
+      if (toolId === "opencode") {
+        try {
+          const baseUrl = await resolveOpencodeBaseUrl({ forceRefresh: true });
+          if (!baseUrl) {
+            await sendText(chatId, `❌ OpenCode 服务不可用，请检查 opencode serve 是否正常运行`);
+            return true;
+          }
+        } catch (error) {
+          await sendText(chatId, `❌ OpenCode 服务启动失败：${error.message}`);
+          return true;
+        }
+      }
+
       const restored = switchThreadTool(chatId, toolId);
       const restoredSession = String(restored?.sessionId || "").trim();
       const restoredModel = String(restored?.model || "").trim();
