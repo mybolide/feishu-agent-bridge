@@ -714,6 +714,7 @@ export function createOpencodeResolvedFetch() {
           method: input.method,
           headers: input.headers,
           body: input.body,
+          duplex: "half",  // Node.js fetch 要求当 body 是 stream 时设置 duplex
           ...init
         };
         return await fetch(newUrl, newInit);
