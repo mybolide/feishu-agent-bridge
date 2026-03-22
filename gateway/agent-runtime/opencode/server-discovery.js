@@ -708,7 +708,15 @@ export function createOpencodeResolvedFetch() {
     let baseUrl = await resolveOpencodeBaseUrl();
     const send = async (targetBaseUrl) => {
       if (input instanceof Request) {
-        return await fetch(new Request(rewriteRequestUrl(input.url, targetBaseUrl), input), init);
+        // 创建新的 Request，避免 body 被锁定的问题
+        const newUrl = rewriteRequestUrl(input.url, targetBaseUrl);
+        const newInit = {
+          method: input.method,
+          headers: input.headers,
+          body: input.body,
+          ...init
+        };
+        return await fetch(newUrl, newInit);
       }
       if (input instanceof URL) {
         return await fetch(rewriteRequestUrl(input.toString(), targetBaseUrl), init);
