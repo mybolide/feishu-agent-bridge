@@ -708,12 +708,13 @@ export function createOpencodeResolvedFetch() {
     let baseUrl = await resolveOpencodeBaseUrl();
     const send = async (targetBaseUrl) => {
       if (input instanceof Request) {
-        // 创建新的 Request，避免 body 被锁定的问题
+        // 克隆请求，避免 body 被锁定的问题
+        const clonedRequest = input.clone();
         const newUrl = rewriteRequestUrl(input.url, targetBaseUrl);
         const newInit = {
-          method: input.method,
-          headers: input.headers,
-          body: input.body,
+          method: clonedRequest.method,
+          headers: clonedRequest.headers,
+          body: clonedRequest.body,
           duplex: "half",  // Node.js fetch 要求当 body 是 stream 时设置 duplex
           ...init
         };
